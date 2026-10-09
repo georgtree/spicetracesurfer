@@ -1,0 +1,263 @@
+# Session evaluator tests. Uses real RBC vectors, not vector mocks.
+package require Tcl 9.0-
+package require tcltest 2
+namespace import ::tcltest::*
+set projectDir [file dirname [file dirname [file normalize [info script]]]]
+lappend auto_path $projectDir [file join $projectDir lib]
+package require spicetracesurfer
+
+namespace eval ::evtest {variable objects {}}
+proc ::evtest::new {class args} {
+    set object [::spicetracesurfer::$class new {*}$args]
+    lappend ::evtest::objects $object
+    return $object
+}
+proc ::evtest::setup {} {
+    set result [new DataSource derived calculation]
+    set evaluator [new Evaluator -resultsource $result]
+    return [list $result $evaluator]
+}
+proc ::evtest::cleanup {} {
+    foreach object [lreverse $::evtest::objects] {
+        if {[info object isa object $object]} {
+            catch {$object destroy}
+        }
+    }
+    set ::evtest::objects {}
+}
+
+test evaluator-state-1.1 {result source is borrowed and automatically attached} -body {
+    lassign [::evtest::setup] result e
+    list [expr {[$e configure -resultsource] eq $result}] [$e configure -resultalias]\
+            [expr {[dict get [$e getSources] results] eq $result}]
+} -cleanup {::evtest::cleanup} -result {1 results 1}
+
+test evaluator-state-1.2 {result source must be a calculation source} -body {
+    set source [::evtest::new DataSource input network]
+    ::evtest::new Evaluator -resultsource $source
+} -cleanup {::evtest::cleanup} -returnCodes error -result {Result source must have type calculation}
+
+test evaluator-state-1.3 {reject a non-object result source} -body {
+    ::evtest::new Evaluator -resultsource noSuchObject
+} -cleanup {::evtest::cleanup} -returnCodes error -match glob -result {Source must be a live*}
+
+test evaluator-state-1.4 {attachment aliases remain stable after renaming a source} -body {
+    lassign [::evtest::setup] result e
+    set source [::evtest::new DataSource input.raw calculation]
+    set alias [$e attach $source]
+    $source configure -name changed
+    list $alias [dict keys [$e getSources]]
+} -cleanup {::evtest::cleanup} -result {input.raw {results input.raw}}
+
+test evaluator-state-1.5 {duplicated aliases are rejected} -body {
+    lassign [::evtest::setup] result e
+    $e attach $result -name results
+} -cleanup {::evtest::cleanup} -returnCodes error -result {Source alias 'results' is already attached}
+
+test evaluator-state-1.6 {detach leaves the borrowed source alive} -body {
+    lassign [::evtest::setup] result e
+    set source [::evtest::new DataSource input calculation]
+    $e attach $source -name in
+    $e detach in
+    list [dict keys [$e getSources]] [info object isa object $source]
+} -cleanup {::evtest::cleanup} -result {results 1}
+
+test evaluator-state-1.7 {cannot detach the result alias} -body {
+    lassign [::evtest::setup] result e
+    $e detach results
+} -cleanup {::evtest::cleanup} -returnCodes error -result {Cannot detach the result source alias}
+
+test evaluator-state-1.8 {resolver rejects unattached sources} -body {
+    lassign [::evtest::setup] result e
+    $e evaluate {trace private.raw plot0 v(out)}
+} -cleanup {::evtest::cleanup} -returnCodes error -result {Source alias 'private.raw' is not attached}
+
+test evaluator-state-1.9 {variables and procedures persist between evaluations} -body {
+    lassign [::evtest::setup] result e
+    $e evaluate {
+        set scale 3
+        proc twice {x} {
+            expr {2*$x}
+        }
+    }
+    $e evaluate {
+        twice $scale
+    }
+} -cleanup {::evtest::cleanup} -result 6
+
+test evaluator-state-1.10 {sessions have separate variables and procedures} -body {
+    lassign [::evtest::setup] result a
+    set b [::evtest::new Evaluator -resultsource $result]
+    $a evaluate {
+        set value 5
+        proc localHelper {} {
+            return yes
+        }
+    }
+    $b evaluate {
+        list [info exists value] [namespace which localHelper]
+    }
+} -cleanup {::evtest::cleanup} -result {0 {}}
+
+test evaluator-state-1.11 {destroying evaluator removes session but preserves sources} -body {
+    lassign [::evtest::setup] result e
+    set ns [$e evaluate {
+        namespace current
+    }]
+    $e destroy
+    list [namespace exists $ns] [info object isa object $result]
+} -cleanup {::evtest::cleanup} -result {0 1}
+
+test evaluator-state-1.12 {deleted attached source gives a controlled error} -body {
+    lassign [::evtest::setup] result e
+    set source [::evtest::new DataSource input calculation]
+    $e attach $source
+    $source destroy
+    $e trace input x
+} -cleanup {::evtest::cleanup} -returnCodes error -match glob -result {Source must be a live*}
+
+test evaluator-state-1.13 {custom result alias} -body {
+    set result [::evtest::new DataSource derived calculation]
+    set e [::evtest::new Evaluator -resultsource $result -resultalias calc]
+    dict keys [$e getSources]
+} -cleanup {::evtest::cleanup} -result calc
+
+test evaluator-state-1.14 {reject invalid numeric result type before allocating a vector} -body {
+    lassign [::evtest::setup] result e
+    $e derive x {1} -numtype invalid
+} -cleanup {::evtest::cleanup} -returnCodes error -result {Numeric type must be real or complex}
+
+test evaluator-state-1.15 {reject empty attachment alias} -body {
+    lassign [::evtest::setup] result e
+    $e attach $result -name {}
+} -cleanup {::evtest::cleanup} -returnCodes error -result {Source alias must not be empty}
+
+test evaluator-state-1.16 {deleted result source prevents result creation} -body {
+    lassign [::evtest::setup] result e
+    $result destroy
+    $e derive x {1}
+} -cleanup {::evtest::cleanup} -returnCodes error -match glob -result {Source must be a live*}
+
+test evaluator-state-1.17 {empty result name is rejected} -body {
+    lassign [::evtest::setup] result e
+    $e derive {} {1}
+} -cleanup {::evtest::cleanup} -returnCodes error -result {Result trace name must not be empty}
+
+test evaluator-vector-2.1 {derive evaluates in session scope and registers its trace} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e evaluate {
+        set scale 4
+        proc offset {} {
+            return 2
+        }
+        derive answer {
+            $scale + [offset]
+        } -type voltage}]
+    list [expr {[$result getTrace answer] eq $tr}] [$tr configure -type] [$tr configure -fullname]\
+            [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {1 voltage derived.answer 6.0}
+
+test evaluator-vector-2.2 {derive can reference earlier results} -body {
+    lassign [::evtest::setup] result e
+    $e evaluate {
+        derive first {3}
+        derive second {[trace results first] * 2}}
+    [[$result getTrace second] getVector] range 0 end
+} -cleanup {::evtest::cleanup} -result 6.0
+
+test evaluator-vector-2.3 {duplicate names preserve the old trace and vector} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e derive x {1}]
+    set code [catch {$e derive x {2}}]
+    list $code [expr {$tr eq [$result getTrace x]}] [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {1 1 1.0}
+
+test evaluator-vector-2.4 {failed expression leaves no trace or temporary vector} -body {
+    lassign [::evtest::setup] result e
+    set before [lsort [rbc::vector names]]
+    set code [catch {$e derive failed {1 + }}]
+    list $code [dict size [$result getTraces]] [expr {$before eq [lsort [rbc::vector names]]}]
+} -cleanup {::evtest::cleanup} -result {1 0 1}
+
+test evaluator-vector-2.5 {published vector survives evaluator destruction even with watchunset} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e evaluate {
+        rbc::vector create samples -watchunset true
+        samples set {1 2 3}
+        publish values samples
+    }]
+    set vector [$tr getVector]
+    $e destroy
+    list [$vector range 0 end] [expr {[$vector variable] eq {}}]
+} -cleanup {::evtest::cleanup} -result {{1.0 2.0 3.0} 1}
+
+test evaluator-vector-2.6 {result source owns and destroys published vectors} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e derive x {5}]
+    set vector [$tr getVector]
+    $result destroy
+    list [info object isa object $tr] [expr {$vector ni [rbc::vector names]}]
+} -cleanup {::evtest::cleanup} -result {0 1}
+
+test evaluator-vector-2.7 {publishing a trace-owned vector is rejected} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e derive first {1}]
+    $e publish second [$tr getVector]
+} -cleanup {::evtest::cleanup} -returnCodes error -match glob -result {Vector is already owned by trace*}
+
+test evaluator-vector-2.8 {publish rejects a missing vector} -body {
+    lassign [::evtest::setup] result e
+    $e publish x nonexistent
+} -cleanup {::evtest::cleanup} -returnCodes error -match glob -result {Publish requires an existing RBC vector*}
+
+test evaluator-vector-2.9 {complex destination is supported} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e derive z {{1 2} * 2} -numtype complex]
+    list [[$tr getVector] type] [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {complex {{2.0 4.0}}}
+
+test evaluator-vector-2.10 {same result names in separate sources do not collide} -body {
+    lassign [::evtest::setup] result a
+    lassign [::evtest::setup] other b
+    set x [[$a derive x {1}] getVector]
+    set y [[$b derive x {2}] getVector]
+    list [expr {$x ne $y}] [$x range 0 end] [$y range 0 end]
+} -cleanup {::evtest::cleanup} -result {1 1.0 2.0}
+
+test evaluator-vector-2.11 {attached source resolves literal dotted and spaced names} -body {
+    lassign [::evtest::setup] input producer
+    $producer derive {output voltage} {7}
+    lassign [::evtest::setup] result e
+    $e attach $input -name {run.1.csv}
+    set tr [$e evaluate {
+        derive x {[trace {run.1.csv} {output voltage}] + 1}
+    }]
+    set values [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result 8.0
+
+test evaluator-vector-2.12 {plot-qualified lookup returns the plot trace vector} -body {
+    lassign [::evtest::setup] input producer
+    set plot [::evtest::new RawPlot plot0 0 $input]
+    set vector [rbc::vector create [info object namespace $input]::inputVector -variable {}]
+    $vector set {4 5}
+    set tr [::spicetracesurfer::Trace new -vector $vector -- v(out) voltage $input]
+    $plot addTrace $tr
+    # Populate the source's plot registry as the RAW loader does.
+    set [info object namespace $input]::RawPlots [dict create plot0 $plot]
+    lassign [::evtest::setup] result e
+    $e attach $input -name input.raw
+    set derived [$e evaluate {
+        derive x {[trace input.raw plot0 v(out)] * 2}
+    }]
+    set values [[$derived getVector] range 0 end]
+} -cleanup {
+    # The source owns the plot; avoid destroying it twice in helper cleanup.
+    if {[info exists plot]} {
+        set ::evtest::objects [lsearch -all -inline -not -exact $::evtest::objects $plot]
+    }
+    ::evtest::cleanup
+} -result {8.0 10.0}
+
+::evtest::cleanup
+namespace delete ::evtest
+cleanupTests

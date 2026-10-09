@@ -428,3 +428,215 @@ oo::configurable create ::spicetracesurfer::Trace {
         }
     }
 }
+
+# Session evaluator. Sources are borrowed; result traces belong to ResultSource.
+oo::configurable create ::spicetracesurfer::Evaluator {
+    property resultsource -kind readable -get {
+        return $ResultSource
+    }
+    property resultalias -kind readable -get {
+        return $ResultAlias
+    }
+    variable Sources ResultSource ResultAlias ScriptNamespace Serial
+
+    constructor {args} {
+        set arguments [argparse -inline {
+            -resultsource=
+            {-resultalias= -default results}
+        }]
+        set Sources {}
+        set Serial 0
+        set ResultSource [dict get $arguments resultsource]
+        set ResultAlias [dict get $arguments resultalias]
+        my CheckResultSource
+        my attach $ResultSource -name $ResultAlias
+        set ScriptNamespace [info object namespace [self]]::script
+        namespace eval $ScriptNamespace {}
+        foreach command {trace derive publish} {
+            interp alias {} ${ScriptNamespace}::$command {} [self] $command
+        }
+    }
+
+    # The object namespace (including script commands/variables) is removed by
+    # TclOO. Borrowed sources and their result vectors deliberately survive.
+    method CheckSource {source} {
+        if {![info object isa typeof $source ::spicetracesurfer::DataSource]} {
+            return -code error {Source must be a live spicetracesurfer::DataSource object}
+        }
+    }
+    method CheckResultSource {} {
+        my CheckSource $ResultSource
+        if {[$ResultSource configure -type] ne {calculation}} {
+            return -code error {Result source must have type calculation}
+        }
+    }
+    method attach {args} {
+        set arguments [argparse -inline -pfirst {
+            source
+            -name=
+        }]
+        my CheckSource [dict get $arguments source]
+        set alias [[dict get $arguments source] configure -name]
+        if {[dict exists $arguments name]} {
+             set alias [dict get $arguments name]
+        }
+        if {$alias eq {}} {
+            return -code error {Source alias must not be empty}
+        }
+        if {[dict exists $Sources $alias]} {
+            return -code error "Source alias '$alias' is already attached"
+        }
+        dict set Sources $alias [dict get $arguments source]
+        return $alias
+    }
+    method detach {alias} {
+        if {$alias eq $ResultAlias} {
+            return -code error {Cannot detach the result source alias}
+        }
+        if {![dict exists $Sources $alias]} {
+            return -code error "Source alias '$alias' is not attached"
+        }
+        dict unset Sources $alias
+    }
+    method getSources {} {
+        return $Sources
+    }
+    method evaluate {script} {
+        namespace eval $ScriptNamespace $script
+    }
+    method trace {args} {
+        set arguments [argparse -inline {
+            alias
+            {plotname -optional}
+            tracename
+        }]
+        if {![dict exists $Sources [dict get $arguments alias]]} {
+            return -code error "Source alias '[dict get $arguments alias]' is not attached"
+        }
+        set source [dict get $Sources [dict get $arguments alias]]
+        my CheckSource $source
+        if {![dict exists $arguments plotname]} {
+            set object [$source getTrace [dict get $arguments tracename]]
+        } else {
+            set object [[$source getRawPlot [dict get $arguments plotname]] getTrace [dict get $arguments tracename]]
+        }
+        return [$object getVector]
+    }
+    method CheckResultName {name} {
+        my CheckResultSource
+        if {$name eq {}} {
+            return -code error {Result trace name must not be empty}
+        }
+        if {[dict exists [$ResultSource getTraces] $name]} {
+            return -code error "Result trace '$name' already exists"
+        }
+    }
+    method NewVectorName {} {
+        my CheckResultSource
+        set prefix [info object namespace $ResultSource]::eval[info object creationid [self]]_
+        while {1} {
+            set name $prefix[incr Serial]
+            if {([namespace which -command $name] eq {}) && ($name ni [rbc::vector names])} {
+                return $name
+            }
+        }
+    }
+    method derive {args} {
+        # Numeric result type must be explicit for complex expressions: RBC
+        # does not allow a real destination to store a complex result.
+        set arguments [argparse -inline -pfirst {
+            name
+            expression
+            {-type= -default unknown}
+            {-numtype= -default real}
+        }]
+        my CheckResultName [dict get $arguments name]
+        set numtype [dict get $arguments numtype]
+        if {$numtype ni {real complex}} {
+            return -code error {Numeric type must be real or complex}
+        }
+        set vector [rbc::vector create [my NewVectorName] -type $numtype -variable {}]
+        set committed 0
+        try {
+            namespace eval $ScriptNamespace [list $vector expr [dict get $arguments expression]]
+            set object [my publish [dict get $arguments name] $vector -type [dict get $arguments type]]
+            set committed 1
+            return $object
+        } finally {
+            if {!$committed && ($vector in [rbc::vector names])} {
+                rbc::vector destroy $vector
+            }
+        }
+    }
+    method VectorOwner {vector} {
+        # Include subclasses; inspect only already assigned vectors so checking
+        # ownership never triggers lazy loading from an unrelated data source.
+        set classes [list ::spicetracesurfer::Trace]
+        set visited {}
+        while {[llength $classes]} {
+            set class [lindex $classes 0]
+            set classes [lrange $classes 1 end]
+            if {$class in $visited} {continue}
+            lappend visited $class
+            lappend classes {*}[info class subclasses $class]
+            foreach object [info class instances $class] {
+                set ns [info object namespace $object]
+                if {[info exists ${ns}::vector] && ([set ${ns}::vector] eq $vector)} {
+                    return $object
+                }
+            }
+        }
+        return
+    }
+    method publish {args} {
+        set arguments [argparse -inline -pfirst {
+            name
+            vector
+            {-type= -default unknown}
+        }]
+        my CheckResultName [dict get $arguments name]
+        # Relative vector commands are resolved in the user session, even when
+        # publish is invoked directly as an evaluator method.
+        set vector [namespace eval $ScriptNamespace [list namespace which -command [dict get $arguments vector]]]
+        if {($vector eq {}) || ($vector ni [rbc::vector names])} {
+            return -code error {Publish requires an existing RBC vector with its standard command name}
+        }
+        set owner [my VectorOwner $vector]
+        if {$owner ne {}} {
+            return -code error "Vector is already owned by trace '$owner'"
+        }
+        set object [::spicetracesurfer::Trace new -- [dict get $arguments name] [dict get $arguments type]\
+                            $ResultSource]
+        set original $vector
+        set mapping [$vector variable]
+        set moved 0
+        set committed 0
+        try {
+            # Move the vector command out of the evaluator namespace so it
+            # survives evaluator destruction. RBC rename does not copy samples.
+            set vector [rbc::vector rename $vector [my NewVectorName]]
+            set moved 1
+            # A mapped array may live in the script namespace and have
+            # -watchunset enabled. Remove that association on ownership transfer.
+            $vector variable {}
+            $object configure -vector $vector
+            $ResultSource addTrace $object
+            set committed 1
+            return $object
+        } finally {
+            if {!$committed} {
+                # Keep caller ownership on failure after a successful move.
+                if {$moved && ($vector in [rbc::vector names])} {
+                    catch {rbc::vector rename $vector $original}
+                    if {$mapping ne {}} {
+                        catch {$original variable $mapping}
+                    }
+                }
+                if {[info object isa object $object]} {
+                    $object configure -vector {}
+                    $object destroy
+                }
+            }
+        }
+    }
+}
