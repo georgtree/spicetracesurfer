@@ -1,0 +1,318 @@
+# generalClasses.test -- tests for spicetracesurfer's data model.
+# Place in tests/ and run with Tcl 9.1 (oo::configurable is required):
+#   tclsh9.1 tests/generalClasses.test
+#   tclsh9.1 tests/generalClasses.test -match spicetracesurfer-trace-*
+# Dependencies must be on auto_path/TCLLIBPATH. Loading the full package
+# also loads Tk; on headless Linux run under an X server, e.g. xvfb-run.
+# Uses real argparse, tclsimrawreader and RBC; no mocks or external RAW file.
+# Tests assert intended behavior: defects are failures, not skipped tests.
+
+package require Tcl 9.0-
+package require tcltest 2
+namespace import ::tcltest::*
+
+set testDir [file dirname [file normalize [info script]]]
+set projectDir [file dirname $testDir]
+foreach path [list $projectDir [file join $projectDir lib]] {
+    if {$path ni $::auto_path} {
+        lappend ::auto_path $path
+    }
+}
+package require spicetracesurfer
+if {![llength [info commands ::oo::configurable]]} {
+    error {These tests require oo::configurable (use Tcl 9.1).}
+}
+
+namespace eval ::stsTest {
+    variable objects {}
+    variable handles {}
+    variable rawFile
+}
+
+# Explicit tracking makes cleanup work even when a test fails halfway through.
+proc ::stsTest::new {class args} {
+    variable objects
+    set obj [::spicetracesurfer::$class new {*}$args]
+    lappend objects $obj
+    return $obj
+}
+
+proc ::stsTest::rawSource {} {
+    variable rawFile
+    variable objects
+    variable handles
+    set ds [new DataSource source1 file -filepath $rawFile -filetype raw]
+    # Retain child commands and the reader handle for defensive test cleanup.
+    # Reading FileHandle here is intentionally white-box: its lifetime is tested.
+    set ns [info object namespace $ds]
+    lappend handles [set ${ns}::FileHandle]
+    dict for {name plot} [$ds getRawPlots] {
+        lappend objects $plot
+        dict for {name trace} [$plot getTraces] {
+            lappend objects $trace
+        }
+    }
+    return $ds
+}
+
+proc ::stsTest::cleanup {} {
+    variable objects
+    variable handles
+    # Owners first, then children left over after a failed destructor.
+    foreach obj $objects {
+        if {[info object isa object $obj]} {
+            catch {$obj destroy}
+        }
+    }
+    foreach handle $handles {
+        if {[namespace which -command $handle] ne {}} {
+            catch {$handle close}
+            if {[namespace which -command $handle] ne {}} {
+                catch {rename $handle {}}
+            }
+        }
+    }
+    set objects {}
+    set handles {}
+}
+
+# Two concatenated ASCII transient plots, with the same variable names but
+# different sample counts. Parentheses in v(2) exercise vector naming.
+set ::stsTest::rawFile [makeFile {Title: spicetracesurfer test plot 0
+Date: Thu Jan 01 00:00:00 2026
+Plotname: Transient Analysis
+Flags: real
+No. Variables: 2
+No. Points: 3
+Variables:
+0 time time
+1 v(2) voltage
+Values:
+0 0.0
+  1.0
+1 1.0
+  2.0
+2 2.0
+  3.0
+Title: spicetracesurfer test plot 1
+Date: Thu Jan 01 00:00:00 2026
+Plotname: Transient Analysis
+Flags: real
+No. Variables: 2
+No. Points: 2
+Variables:
+0 time time
+1 v(2) voltage
+Values:
+0 0.0
+  10.0
+1 1.0
+  20.0
+} sts-generalClasses.raw]
+
+test spicetracesurfer-source-1.1 {non-file source construction} -body {
+    set ds [::stsTest::new DataSource calculated calculation]
+    list [$ds configure -name] [$ds configure -type]
+} -cleanup {::stsTest::cleanup} -result {calculated calculation}
+
+test spicetracesurfer-source-1.2 {reject empty name} -body {
+    ::stsTest::new DataSource {} calculation
+} -cleanup {::stsTest::cleanup} -returnCodes error -result {Name cannot be empty string}
+
+test spicetracesurfer-source-1.3 {reject invalid source type} -body {
+    ::stsTest::new DataSource example invalid
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob\
+        -result {Source type 'invalid' is not one of the allowed types:*}
+
+test spicetracesurfer-source-1.4 {reject invalid file type} -body {
+    ::stsTest::new DataSource example file -filepath unused -filetype invalid
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob\
+        -result {File type 'invalid' is not one of the allowed types:*}
+
+test spicetracesurfer-source-1.5 {file properties and default type} -body {
+    set ds [::stsTest::new DataSource example -filepath unused.csv -filetype csv]
+    list [$ds configure -type] [$ds configure -filepath] [$ds configure -filetype]
+} -cleanup {::stsTest::cleanup} -result {file unused.csv csv}
+
+test spicetracesurfer-source-1.6 {filetype is forbidden on a calculation source} -setup {
+    set ds [::stsTest::new DataSource example calculation]
+} -body {
+    $ds configure -filetype raw
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {To set filetype type must be file,*}
+
+test spicetracesurfer-source-1.7 {filepath is forbidden on a calculation source} -setup {
+    set ds [::stsTest::new DataSource example calculation]
+} -body {
+    $ds configure -filepath unused.raw
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {To set filepath type must be file,*}
+
+test spicetracesurfer-source-1.8 {empty collections are valid dictionaries} -body {
+    set ds [::stsTest::new DataSource example calculation]
+    list [$ds getTraces] [$ds getRawPlots]
+} -cleanup {::stsTest::cleanup} -result {{} {}}
+
+test spicetracesurfer-source-1.9 {non-file sources cannot read RAW vectors} -setup {
+    set ds [::stsTest::new DataSource example calculation]
+} -body {
+    $ds readRawVector 0 time ::stsTest
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {*data source is not a file type}
+
+test spicetracesurfer-source-1.10 {CSV sources cannot read RAW vectors} -setup {
+    set ds [::stsTest::new DataSource example file -filepath unused.csv -filetype csv]
+} -body {
+    $ds readRawVector 0 time ::stsTest
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {*file type of data source is not raw}
+
+test spicetracesurfer-plot-2.1 {plot construction and full name} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set plot [::stsTest::new RawPlot plot7 7 $ds]
+    list [$plot configure -name] [$plot configure -index] \
+        [expr {[$plot configure -source] eq $ds}] [$plot configure -fullname]
+} -cleanup {::stsTest::cleanup} -result {plot7 7 1 source1.plot7}
+
+test spicetracesurfer-plot-2.2 {reject an object of the wrong class} -setup {
+    set other [oo::object new]
+    lappend ::stsTest::objects $other
+} -body {
+    ::stsTest::new RawPlot plot0 0 $other
+} -cleanup {::stsTest::cleanup} -returnCodes error\
+        -result {Source must be an object of class ::spicetracesurfer::DataSource}
+
+test spicetracesurfer-plot-2.3 {new plot has an empty trace dictionary} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set plot [::stsTest::new RawPlot plot0 0 $ds]
+    $plot getTraces
+} -cleanup {::stsTest::cleanup} -result {}
+
+test spicetracesurfer-plot-2.4 {adding a trace sets lookup and back-reference} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set plot [::stsTest::new RawPlot plot0 0 $ds]
+    set tr [::stsTest::new Trace v(2) voltage $ds]
+    $plot addTrace $tr
+    list [dict keys [$plot getTraces]] [expr {[$plot getTrace v(2)] eq $tr}]\
+            [expr {[$tr configure -rawplot] eq $plot}] [$tr configure -fullname]
+} -cleanup {::stsTest::cleanup} -result {v(2) 1 1 source1.plot0.v(2)}
+
+test spicetracesurfer-plot-2.5 {full names follow source renaming} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set plot [::stsTest::new RawPlot plot0 0 $ds]
+    $ds configure -name renamed
+    $plot configure -fullname
+} -cleanup {::stsTest::cleanup} -result renamed.plot0
+
+test spicetracesurfer-trace-3.1 {trace construction} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set tr [::stsTest::new Trace v(2) voltage $ds]
+    list [$tr configure -name] [$tr configure -type] [expr {[$tr configure -source] eq $ds}]
+} -cleanup {::stsTest::cleanup} -result {v(2) voltage 1}
+
+test spicetracesurfer-trace-3.2 {reject a source of the wrong class} -setup {
+    set other [oo::object new]
+    lappend ::stsTest::objects $other
+} -body {
+    ::stsTest::new Trace v(2) voltage $other
+} -cleanup {::stsTest::cleanup} -returnCodes error\
+        -result {Source must be an object of class ::spicetracesurfer::DataSource}
+
+test spicetracesurfer-trace-3.3 {unloaded trace retains assigned length} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set tr [::stsTest::new Trace v(2) voltage $ds]
+    $tr configure -length 17
+    $tr configure -length
+} -cleanup {::stsTest::cleanup} -result 17
+
+test spicetracesurfer-trace-3.4 {unloaded trace retains assigned numeric type} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set tr [::stsTest::new Trace v(2) voltage $ds]
+    $tr configure -numtype real
+    $tr configure -numtype
+} -cleanup {::stsTest::cleanup} -result real
+
+test spicetracesurfer-trace-3.5 {source-owned trace lookup and empty rawplot} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set tr [::stsTest::new Trace derived voltage $ds]
+    $ds addTrace $tr
+    list [dict keys [$ds getTraces]] [expr {[$ds getTrace derived] eq $tr}] [$tr configure -rawplot]
+} -cleanup {::stsTest::cleanup} -result {derived 1 {}}
+
+test spicetracesurfer-trace-3.6 {source destruction destroys directly owned traces} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    set tr [::stsTest::new Trace derived voltage $ds]
+    $ds addTrace $tr
+    $ds destroy
+    info object isa object $tr
+} -cleanup {::stsTest::cleanup} -result 0
+
+test spicetracesurfer-raw-4.1 {real reader discovers both plots and variables} -body {
+    set ds [::stsTest::rawSource]
+    set p0 [$ds getRawPlot plot0]
+    set p1 [$ds getRawPlot plot1]
+    list [lsort [dict keys [$ds getRawPlots]]] [$p0 configure -index] [$p1 configure -index]\
+            [lsort [dict keys [$p0 getTraces]]] [lsort [dict keys [$p1 getTraces]]] [$ds configure -dialect]
+} -cleanup {::stsTest::cleanup} -result {{plot0 plot1} 0 1 {time v(2)} {time v(2)} generic}
+
+test spicetracesurfer-raw-4.2 {vectors are loaded lazily and cached} -body {
+    set ds [::stsTest::rawSource]
+    set tr [[$ds getRawPlot plot0] getTrace v(2)]
+    set ns [info object namespace $tr]
+    set unloaded [expr {![info exists ${ns}::vector]}]
+    set vec [$tr getVector]
+    list $unloaded [expr {$vec ne {}}] [expr {$vec eq [$tr getVector]}] [$vec length]
+} -cleanup {::stsTest::cleanup} -result {1 1 1 3}
+
+test spicetracesurfer-raw-4.3 {loaded trace metadata delegates to its vector} -body {
+    set ds [::stsTest::rawSource]
+    set tr [[$ds getRawPlot plot0] getTrace v(2)]
+    set vec [$tr getVector]
+    list [$tr configure -fullname] [$tr configure -type] [$tr configure -len] \
+        [expr {[$tr configure -numtype] eq [$vec type]}]
+} -cleanup {::stsTest::cleanup} -result {source1.plot0.v(2) voltage 3 1}
+
+test spicetracesurfer-raw-4.4 {same names in different plots get separate vectors} -body {
+    set ds [::stsTest::rawSource]
+    set a [[[$ds getRawPlot plot0] getTrace v(2)] getVector]
+    set b [[[$ds getRawPlot plot1] getTrace v(2)] getVector]
+    list [expr {$a ne $b}] [$a length] [$b length]
+} -cleanup {::stsTest::cleanup} -result {1 3 2}
+
+test spicetracesurfer-raw-4.5 {two sources of the same file have independent vectors} -body {
+    set ds1 [::stsTest::rawSource]
+    set ds2 [::stsTest::rawSource]
+    set a [[[$ds1 getRawPlot plot0] getTrace v(2)] getVector]
+    set b [[[$ds2 getRawPlot plot0] getTrace v(2)] getVector]
+    $ds1 destroy
+    list [expr {$a ne $b}] [expr {[namespace which -command $a] eq {}}] [$b length]
+} -cleanup {::stsTest::cleanup} -result {1 1 3}
+
+test spicetracesurfer-raw-4.6 {destroying a source destroys plots, traces and loaded vectors} -body {
+    set ds [::stsTest::rawSource]
+    set plot [$ds getRawPlot plot0]
+    set tr [$plot getTrace v(2)]
+    set vec [$tr getVector]
+    $ds destroy
+    list [info object isa object $plot] [info object isa object $tr] [expr {[namespace which -command $vec] eq {}}]
+} -cleanup {::stsTest::cleanup} -result {0 0 1}
+
+test spicetracesurfer-raw-4.7 {destroying a source closes its RAW reader command} -body {
+    set ds [::stsTest::rawSource]
+    set handle [set [info object namespace $ds]::FileHandle]
+    $ds destroy
+    expr {[namespace which -command $handle] eq {}}
+} -cleanup {::stsTest::cleanup} -result 1
+
+test spicetracesurfer-raw-4.8 {missing plot lookup fails} -setup {
+    set ds [::stsTest::rawSource]
+} -body {
+    $ds getRawPlot nonexistent
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {*nonexistent*}
+
+test spicetracesurfer-raw-4.9 {missing trace lookup fails} -setup {
+    set ds [::stsTest::rawSource]
+} -body {
+    [$ds getRawPlot plot0] getTrace nonexistent
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {*nonexistent*}
+
+::stsTest::cleanup
+removeFile $::stsTest::rawFile
+namespace delete ::stsTest
+cleanupTests
