@@ -125,7 +125,7 @@ test evaluator-state-1.13 {custom result alias} -body {
 test evaluator-state-1.14 {reject invalid numeric result type before allocating a vector} -body {
     lassign [::evtest::setup] result e
     $e derive x {1} -numtype invalid
-} -cleanup {::evtest::cleanup} -returnCodes error -result {Numeric type must be real or complex}
+} -cleanup {::evtest::cleanup} -returnCodes error -result {Numeric type must be auto, real or complex}
 
 test evaluator-state-1.15 {reject empty attachment alias} -body {
     lassign [::evtest::setup] result e
@@ -257,6 +257,56 @@ test evaluator-vector-2.12 {plot-qualified lookup returns the plot trace vector}
     }
     ::evtest::cleanup
 } -result {8.0 10.0}
+
+test evaluator-auto-3.1 {complex result type is automatic} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e derive z {{1 2} * 2}]
+    list [$tr configure -numtype] [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {complex {{2.0 4.0}}}
+
+test evaluator-auto-3.2 {real result from complex input stays real} -body {
+    lassign [::evtest::setup] result e
+    $e derive z {{3 4}}
+    set tr [$e derive magnitude {abs([trace results z])}]
+    list [$tr configure -numtype] [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {real 5.0}
+
+test evaluator-auto-3.3 {substitutions run exactly once in session scope} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e evaluate {
+        set calls 0
+        set scale 2
+        proc nextValue {} {variable calls; incr calls; return {1 3}}
+        derive answer {$scale + [nextValue]}
+    }]
+    list [$e evaluate {set calls}] [$tr configure -numtype] [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {1 complex {{3.0 3.0}}}
+
+test evaluator-auto-3.4 {explicit auto accepts real results} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e derive x {2 + 3} -numtype auto]
+    list [$tr configure -numtype] [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {real 5.0}
+
+test evaluator-auto-3.5 {explicit real still rejects complex results without leaks} -body {
+    lassign [::evtest::setup] result e
+    set before [lsort [rbc::vector names]]
+    set code [catch {$e derive x {{1 2}} -numtype real}]
+    list $code [dict size [$result getTraces]] [expr {$before eq [lsort [rbc::vector names]]}]
+} -cleanup {::evtest::cleanup} -result {1 0 1}
+
+test evaluator-auto-3.6 {explicit complex still promotes real results} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e derive x {5} -numtype complex]
+    list [$tr configure -numtype] [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {complex {{5.0 0.0}}}
+
+test evaluator-auto-3.7 {auto result survives evaluator destruction} -body {
+    lassign [::evtest::setup] result e
+    set tr [$e derive z {{1 2}}]
+    $e destroy
+    list [$tr configure -numtype] [[$tr getVector] range 0 end]
+} -cleanup {::evtest::cleanup} -result {complex {{1.0 2.0}}}
 
 ::evtest::cleanup
 namespace delete ::evtest

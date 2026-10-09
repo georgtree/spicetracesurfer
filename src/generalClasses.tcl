@@ -542,28 +542,34 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         }
     }
     method derive {args} {
-        # Numeric result type must be explicit for complex expressions: RBC
-        # does not allow a real destination to store a complex result.
+        # Let RBC create a destination with the expression's actual numeric
+        # type. Explicit real/complex modes retain the previous behaviour.
         set arguments [argparse -inline -pfirst {
             name
             expression
             {-type= -default unknown}
-            {-numtype= -default real}
+            {-numtype= -default auto}
         }]
         my CheckResultName [dict get $arguments name]
         set numtype [dict get $arguments numtype]
-        if {$numtype ni {real complex}} {
-            return -code error {Numeric type must be real or complex}
+        if {$numtype ni {auto real complex}} {
+            return -code error {Numeric type must be auto, real or complex}
         }
-        set vector [rbc::vector create [my NewVectorName] -type $numtype -variable {}]
+        set vector {}
         set committed 0
         try {
-            namespace eval $ScriptNamespace [list $vector expr [dict get $arguments expression]]
+            if {$numtype eq {auto}} {
+                set vector [namespace eval $ScriptNamespace [list ::rbc::vector expr -name [my NewVectorName]\
+                                                                     [dict get $arguments expression]]]
+            } else {
+                set vector [rbc::vector create [my NewVectorName] -type $numtype -variable {}]
+                namespace eval $ScriptNamespace [list $vector expr [dict get $arguments expression]]
+            }
             set object [my publish [dict get $arguments name] $vector -type [dict get $arguments type]]
             set committed 1
             return $object
         } finally {
-            if {!$committed && ($vector in [rbc::vector names])} {
+            if {!$committed && ($vector ne {}) && ($vector in [rbc::vector names])} {
                 rbc::vector destroy $vector
             }
         }
