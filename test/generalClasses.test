@@ -27,6 +27,7 @@ namespace eval ::stsTest {
     variable objects {}
     variable handles {}
     variable rawFile
+    variable csvFiles {}
 }
 
 # Explicit tracking makes cleanup work even when a test fails halfway through.
@@ -39,6 +40,7 @@ proc ::stsTest::new {class args} {
 
 proc ::stsTest::rawSource {} {
     variable rawFile
+    variable csvFiles {}
     variable objects
     variable handles
     set ds [new DataSource source1 file -filepath $rawFile -filetype raw]
@@ -58,6 +60,7 @@ proc ::stsTest::rawSource {} {
 proc ::stsTest::cleanup {} {
     variable objects
     variable handles
+    variable csvFiles
     # Owners first, then children left over after a failed destructor.
     foreach obj $objects {
         if {[info object isa object $obj]} {
@@ -72,8 +75,20 @@ proc ::stsTest::cleanup {} {
             }
         }
     }
+    foreach path $csvFiles {
+        ::tcltest::removeFile $path
+    }
+    set csvFiles {}
     set objects {}
     set handles {}
+}
+
+# CSV fixtures are created per test and removed by the existing cleanup helper.
+proc ::stsTest::csvSource {contents args} {
+    variable csvFiles
+    set path [::tcltest::makeFile $contents sts-generalClasses.csv]
+    lappend csvFiles $path
+    return [new DataSource source1 -filepath $path -filetype csv {*}$args]
 }
 
 # Two concatenated ASCII transient plots, with the same variable names but
@@ -110,6 +125,7 @@ Values:
   20.0
 } sts-generalClasses.raw]
 
+### spicetracesurfer-source
 test spicetracesurfer-source-1.1 {non-file source construction} -body {
     set ds [::stsTest::new DataSource calculated calculation]
     list [$ds configure -name] [$ds configure -type]
@@ -130,9 +146,9 @@ test spicetracesurfer-source-1.4 {reject invalid file type} -body {
         -result {File type 'invalid' is not one of the allowed types:*}
 
 test spicetracesurfer-source-1.5 {file properties and default type} -body {
-    set ds [::stsTest::new DataSource example -filepath unused.csv -filetype csv]
-    list [$ds configure -type] [$ds configure -filepath] [$ds configure -filetype]
-} -cleanup {::stsTest::cleanup} -result {file unused.csv csv}
+    set ds [::stsTest::csvSource "time,v(2)\n0,1"]
+    list [$ds configure -type] [file tail [$ds configure -filepath]] [$ds configure -filetype]
+} -cleanup {::stsTest::cleanup} -result {file sts-generalClasses.csv csv}
 
 test spicetracesurfer-source-1.6 {filetype is forbidden on a calculation source} -setup {
     set ds [::stsTest::new DataSource example calculation]
@@ -158,11 +174,12 @@ test spicetracesurfer-source-1.9 {non-file sources cannot read RAW vectors} -set
 } -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {*data source is not a file type}
 
 test spicetracesurfer-source-1.10 {CSV sources cannot read RAW vectors} -setup {
-    set ds [::stsTest::new DataSource example file -filepath unused.csv -filetype csv]
+    set ds [::stsTest::csvSource "time,v(2)\n0,1"]
 } -body {
     $ds readRawVector 0 time ::stsTest
 } -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {*file type of data source is not raw}
 
+### spicetracesurfer-plot
 test spicetracesurfer-plot-2.1 {plot construction and full name} -body {
     set ds [::stsTest::new DataSource source1 calculation]
     set plot [::stsTest::new RawPlot plot7 7 $ds]
@@ -200,6 +217,7 @@ test spicetracesurfer-plot-2.5 {full names follow source renaming} -body {
     $plot configure -fullname
 } -cleanup {::stsTest::cleanup} -result renamed.plot0
 
+### spicetracesurfer-trace
 test spicetracesurfer-trace-3.1 {trace construction} -body {
     set ds [::stsTest::new DataSource source1 calculation]
     set tr [::stsTest::new Trace v(2) voltage $ds]
@@ -243,6 +261,7 @@ test spicetracesurfer-trace-3.6 {source destruction destroys directly owned trac
     info object isa object $tr
 } -cleanup {::stsTest::cleanup} -result 0
 
+### spicetracesurfer-raw
 test spicetracesurfer-raw-4.1 {real reader discovers both plots and variables} -body {
     set ds [::stsTest::rawSource]
     set p0 [$ds getRawPlot plot0]
@@ -264,7 +283,7 @@ test spicetracesurfer-raw-4.3 {loaded trace metadata delegates to its vector} -b
     set ds [::stsTest::rawSource]
     set tr [[$ds getRawPlot plot0] getTrace v(2)]
     set vec [$tr getVector]
-    list [$tr configure -fullname] [$tr configure -type] [$tr configure -len] \
+    list [$tr configure -fullname] [$tr configure -type] [$tr configure -length] \
         [expr {[$tr configure -numtype] eq [$vec type]}]
 } -cleanup {::stsTest::cleanup} -result {source1.plot0.v(2) voltage 3 1}
 
@@ -311,6 +330,152 @@ test spicetracesurfer-raw-4.9 {missing trace lookup fails} -setup {
 } -body {
     [$ds getRawPlot plot0] getTrace nonexistent
 } -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {*nonexistent*}
+
+### spicetracesurfer-csv
+test spicetracesurfer-csv-5.1 {batch boundaries preserve every value and column order} -body {
+    set ds [::stsTest::csvSource "time,v(2)\n0,10\n1,11\n2,12\n3,13\n4,14" -csvbatchsize 2]
+    set time [[$ds getTrace time] getVector]
+    set voltage [[$ds getTrace v(2)] getVector]
+    list [dict keys [$ds getTraces]] [$ds getRawPlots] [$time range 0 end] [$voltage range 0 end]
+} -cleanup {::stsTest::cleanup} -result {{time v(2)} {} {0.0 1.0 2.0 3.0 4.0} {10.0 11.0 12.0 13.0 14.0}}
+
+test spicetracesurfer-csv-5.2 {CSV traces already own vectors and belong directly to their source} -body {
+    set ds [::stsTest::csvSource "time,v(2)\n0,10"]
+    set tr [$ds getTrace v(2)]
+    set vec [$tr configure -vector]
+    list [expr {$vec eq [$tr getVector]}] [$tr configure -rawplot] [$tr configure -fullname] [$tr configure -length]\
+            [$tr configure -type]
+} -cleanup {::stsTest::cleanup} -result {1 {} source1.v(2) 1 unknown}
+
+test spicetracesurfer-csv-5.3 {headerless input keeps first row and uses one-based default names} -body {
+    set ds [::stsTest::csvSource "0,10\n1,11\n2,12" -csvheader false -csvbatchsize 1]
+    list [dict keys [$ds getTraces]] [[[$ds getTrace column2] getVector] range 0 end]
+} -cleanup {::stsTest::cleanup} -result {{column1 column2} {10.0 11.0 12.0}}
+
+test spicetracesurfer-csv-5.4 {custom name template and delimiter} -body {
+    set ds [::stsTest::csvSource "0;10\n1;11" -csvheader false -csvnametemplate {signal_%03d} -csvdelimiter {;}]
+    list [dict keys [$ds getTraces]] [[[$ds getTrace signal_002] getVector] range 0 end]
+} -cleanup {::stsTest::cleanup} -result {{signal_001 signal_002} {10.0 11.0}}
+
+test spicetracesurfer-csv-5.5 {quoted headers are parsed by tclcsv} -body {
+    set ds [::stsTest::csvSource {"time","output, voltage"
+0,1
+1,2}]
+    list [dict keys [$ds getTraces]] [[$ds getTrace {output, voltage}] configure -fullname]
+} -cleanup {::stsTest::cleanup} -result {{time {output, voltage}} {source1.output, voltage}}
+
+test spicetracesurfer-csv-5.6 {header-only file creates empty vectors} -body {
+    set ds [::stsTest::csvSource "time,v(2)"]
+    list [dict size [$ds getTraces]] [[$ds getTrace time] configure -length]
+} -cleanup {::stsTest::cleanup} -result {2 0}
+
+test spicetracesurfer-csv-5.7 {reject duplicate header names} -body {
+    ::stsTest::csvSource "x,x\n0,1"
+} -cleanup {::stsTest::cleanup} -returnCodes error -result {Duplicate CSV column name 'x'}
+
+test spicetracesurfer-csv-5.8 {reject empty header names} -body {
+    ::stsTest::csvSource "x,\n0,1"
+} -cleanup {::stsTest::cleanup} -returnCodes error -result {CSV column names must not be empty}
+
+test spicetracesurfer-csv-5.9 {reject ragged records with a record number} -body {
+    ::stsTest::csvSource "x,y\n0,1\n2" -csvbatchsize 1
+} -cleanup {::stsTest::cleanup} -returnCodes error -result {CSV record 3 has 1 fields; expected 2}
+
+test spicetracesurfer-csv-5.10 {reject nonnumeric cells with record and column context} -body {
+    ::stsTest::csvSource "x,y\n0,1\n2,no" -csvbatchsize 1
+} -cleanup {::stsTest::cleanup} -returnCodes error \
+    -result {CSV record 3, column 'y': expected a number, got 'no'}
+
+test spicetracesurfer-csv-5.11 {template must produce distinct names} -body {
+    ::stsTest::csvSource "0,1" -csvheader false -csvnametemplate signal
+} -cleanup {::stsTest::cleanup} -returnCodes error -result {CSV name template must produce distinct column names}
+
+test spicetracesurfer-csv-5.12 {reject invalid batch size} -body {
+    ::stsTest::csvSource "x\n1" -csvbatchsize 0
+} -cleanup {::stsTest::cleanup} -returnCodes error -result {CSV batch size must be a positive integer}
+
+test spicetracesurfer-csv-5.13 {source destruction removes CSV traces and vectors} -body {
+    set ds [::stsTest::csvSource "x,y\n0,1"]
+    set tr [$ds getTrace y]
+    set vec [$tr getVector]
+    $ds destroy
+    list [info object isa object $tr] [expr {[namespace which -command $vec] eq {}}]
+} -cleanup {::stsTest::cleanup} -result {0 1}
+
+test spicetracesurfer-csv-5.14 {failed loading releases channels, traces and vectors} -body {
+    set channels [lsort [chan names]]
+    set vectors [lsort [rbc::vector names]]
+    set traces [lsort [info class instances ::spicetracesurfer::Trace]]
+    set code [catch {::stsTest::csvSource "x,y\n0,1\n2,bad" -csvbatchsize 1}]
+    list $code [expr {$channels eq [lsort [chan names]]}] [expr {$vectors eq [lsort [rbc::vector names]]}]\
+            [expr {$traces eq [lsort [info class instances ::spicetracesurfer::Trace]]}]
+} -cleanup {::stsTest::cleanup} -result {1 1 1 1}
+
+test spicetracesurfer-csv-5.15 {UTF-8 BOM is accepted in headerless numeric input} -body {
+    set ds [::stsTest::csvSource "\ufeff0,10\n1,11" -csvheader false]
+    [[$ds getTrace column1] getVector] range 0 end
+} -cleanup {::stsTest::cleanup} -result {0.0 1.0}
+
+test spicetracesurfer-csv-5.16 {invalid template reports format failure} -body {
+    ::stsTest::csvSource "0,1" -csvheader false -csvnametemplate {%d_%d}
+} -cleanup {::stsTest::cleanup} -returnCodes error -match glob -result {*not enough arguments*}
+
+test spicetracesurfer-csv-5.17 {empty input cannot establish columns} -body {
+    ::stsTest::csvSource {} -csvheader false
+} -cleanup {::stsTest::cleanup} -returnCodes error -result {CSV file has no records}
+
+test spicetracesurfer-csv-5.18 {header names beginning with a dash are positional trace names} -body {
+    set ds [::stsTest::csvSource "-signal,time\n10,0"]
+    list [dict keys [$ds getTraces]] [[$ds getTrace -signal] configure -length]
+} -cleanup {::stsTest::cleanup} -result {{-signal time} 1}
+
+test spicetracesurfer-csv-properties-6.1 {CSV defaults are readable object properties} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] \
+        [$ds configure -csvencoding] [$ds configure -csvheader] [$ds configure -csvnametemplate]
+} -cleanup {::stsTest::cleanup} -result {8192 , utf-8 true column%d}
+
+test spicetracesurfer-csv-properties-6.2 {constructor assigns all CSV properties} -body {
+    set ds [::stsTest::new DataSource source1 calculation -csvbatchsize 32 \
+        -csvdelimiter {;} -csvencoding iso8859-1 -csvheader false -csvnametemplate {v%03d}]
+    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] \
+        [$ds configure -csvencoding] [$ds configure -csvheader] [$ds configure -csvnametemplate]
+} -cleanup {::stsTest::cleanup} -result {32 {;} iso8859-1 false v%03d}
+
+test spicetracesurfer-csv-properties-6.3 {CSV properties can be configured after construction} -body {
+    set ds [::stsTest::new DataSource source1 calculation]
+    $ds configure -csvbatchsize 16 -csvdelimiter {;} -csvencoding ascii \
+        -csvheader false -csvnametemplate {signal_%d}
+    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] \
+        [$ds configure -csvencoding] [$ds configure -csvheader] [$ds configure -csvnametemplate]
+} -cleanup {::stsTest::cleanup} -result {16 {;} ascii false signal_%d}
+
+### spicetracesurfer-csv-properties
+# Every rejected setter must leave its previously configured value intact.
+foreach {id option invalid} {
+    4 csvbatchsize 0
+    5 csvbatchsize 1.5
+    6 csvdelimiter {}
+    7 csvdelimiter {||}
+    8 csvdelimiter \u00e9
+    9 csvencoding no-such-encoding
+    10 csvheader perhaps
+    11 csvnametemplate {%d_%d}
+    12 csvnametemplate {}
+    13 csvnametemplate fixed
+} {
+    test spicetracesurfer-csv-properties-6.$id "reject invalid -$option without changing its value"\
+            -body [string map [list @OPTION@ [list -$option] @VALUE@ [list $invalid]] {
+        set ds [::stsTest::new DataSource source1 calculation]
+        set old [$ds configure @OPTION@]
+        set code [catch {$ds configure @OPTION@ @VALUE@}]
+        list $code [expr {$old eq [$ds configure @OPTION@]}]
+    }] -cleanup {::stsTest::cleanup} -result {1 1}
+}
+
+test spicetracesurfer-csv-properties-6.14 {constructor validation precedes file opening} -body {
+    ::stsTest::new DataSource source1 file -filepath {} -filetype csv -csvheader perhaps
+} -cleanup {::stsTest::cleanup} -returnCodes error -result {CSV header flag must be a boolean}
 
 ::stsTest::cleanup
 removeFile $::stsTest::rawFile

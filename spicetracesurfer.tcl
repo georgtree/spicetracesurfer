@@ -11,6 +11,7 @@ package require Tcl 9.0-
 package require argparse
 package require rbc::graphtoolbar
 package require tclsimrawreader
+package require tclcsv
 package require splitlayout
 
 package provide spicetracesurfer 0.1
