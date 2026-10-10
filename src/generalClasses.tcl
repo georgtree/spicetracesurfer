@@ -73,6 +73,8 @@ oo::configurable create ::spicetracesurfer::DataSource {
                 RawPlot or Trace objects. Temporary vectors live in a private namespace; adopted vectors are renamed
                 into their owning Trace namespace. Cleanup releases all resources not transferred during commit.
 
+                Nested reload and source destruction are rejected until the active reload and its cleanup finish.
+
                 `$source reload` stages replacement data, then updates matching plots and traces in place. Plots match
                 by plot key/index; traces match by local name, so CSV column reordering preserves identity. Matching
                 Trace objects retain axis assignments. Loaded same-type vectors are updated using dup and retain their
@@ -221,7 +223,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
     }
     variable name type filepath filetype dialect FileHandle RawPlots Traces
     variable csvbatchsize csvdelimiter csvencoding csvheader csvnametemplate
-    variable FileLocked RawFileStamp RawPath StageSerial
+    variable FileLocked RawFileStamp RawPath StageSerial Reloading
     initialize {
         variable SourceTypes
         const SourceTypes {file calculation network spreadsheet}
@@ -261,6 +263,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
             {-csvnametemplate= -default column%d}
         }]
         set FileLocked 0
+        set Reloading 0
         set StageSerial 0
         set Traces [dict create]
         set RawPlots [dict create]
@@ -290,6 +293,21 @@ oo::configurable create ::spicetracesurfer::DataSource {
             my DisposeData
             return -options $options $message
         }
+    }
+    method CheckNotReloading {} {
+        # Rejects reentrant reload and destruction while replacement data is being prepared or committed.
+        #
+        # Returns: Nothing when idle; a structured busy error during reload, including staging cleanup.
+        if {[info exists Reloading] && $Reloading} {
+            return -code error -errorcode {SPICETRACESURFER SOURCE BUSY} {DataSource reload is in progress}
+        }
+    }
+    method destroy {} {
+        # Destroys the source and its owned data when no reload is active.
+        #
+        # Returns: Nothing. Reentrant destruction during reload is rejected before cleanup starts.
+        my CheckNotReloading
+        next
     }
     destructor {
         # Destroys owned traces and raw plots, then closes an existing RAW reader.
@@ -350,16 +368,23 @@ oo::configurable create ::spicetracesurfer::DataSource {
         # Read failures preserve objects and loaded vectors, but cannot restore externally overwritten RAW bytes.
         # Commit-time copy/allocation errors are propagated without rollback of earlier updates. Notifications
         # are not batched across vectors. The owner restores vector protection even when a copy fails.
+        # Nested reload and source destruction are rejected until staging, commit and cleanup finish.
         # Returns: This DataSource object.
+        my CheckNotReloading
         if {($type ne {file}) || ($filetype ni {raw csv})} {
             return -code error {Reload requires a RAW or CSV file source}
         }
-        set stage [my StageFile]
+        set Reloading 1
         try {
-            my CommitStage stage
-            return [self]
+            set stage [my StageFile]
+            try {
+                my CommitStage stage
+                return [self]
+            } finally {
+                my DisposeStage $stage
+            }
         } finally {
-            my DisposeStage $stage
+            set Reloading 0
         }
     }
     method NewStage {} {
@@ -1345,6 +1370,20 @@ oo::configurable create ::spicetracesurfer::Evaluator {
                 Separate evaluator objects have separate script namespaces. This is organisation for trusted scripts,
                 not a security sandbox: fully qualified Tcl commands can access other application state.
 
+                ## Evaluation errors and reset
+                Evaluation errors propagate with their Tcl error options and stack trace. Variables, helper procedures
+                and completed results remain available for inspection and continued work; an error does not reset the
+                session. The busy state is cleared on every exit. During evaluation, nested evaluate, reset, destroy,
+                attach and detach calls are rejected. trace, derive and publish remain available to the running script.
+
+                `$evaluator reset` explicitly replaces the script namespace, restoring built-in aliases and configured
+                imports. Attached sources, published calculation traces, configuration and the result-vector name counter
+                survive. Variables, procedures, extra imports and temporary vector commands in the old script namespace
+                are removed. The replacement is fully initialized first; import failure leaves the old environment intact.
+                Reset also rejects reentrant lifecycle changes while deleting the old environment. Arbitrary after
+                callbacks and resources created outside the script namespace are not tracked or canceled. These guards
+                prevent overlapping operations; they do not interrupt a long-running script or keep the GUI responsive.
+
                 ## Preloaded commands
                 The spicetracesurfer package loads tclmeasure. By default each evaluator imports its exported
                 ::tclmeasure::measure command as measure in the script namespace. Imports persist across evaluate
@@ -1414,7 +1453,7 @@ oo::configurable create ::spicetracesurfer::Evaluator {
     property imports -kind readable -get {
         return $Imports
     }
-    variable Sources ResultSource ResultAlias ScriptNamespace Serial Imports
+    variable Sources ResultSource ResultAlias ScriptNamespace Serial Imports Busy NamespaceSerial
 
     constructor {args} {
         # Creates a persistent script environment borrowing a calculation source.
@@ -1432,6 +1471,8 @@ oo::configurable create ::spicetracesurfer::Evaluator {
             {-resultalias= -default results}
             {-imports= -default ::tclmeasure::measure}
         }]
+        set Busy {}
+        set NamespaceSerial 0
         set Sources {}
         set Serial 0
         set ResultSource [dict get $arguments resultsource]
@@ -1439,23 +1480,80 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         set Imports [dict get $arguments imports]
         my CheckResultSource
         my attach $ResultSource -name $ResultAlias
-        set ScriptNamespace [info object namespace [self]]::script
-        namespace eval $ScriptNamespace {}
-        foreach command {trace derive publish} {
-            interp alias {} ${ScriptNamespace}::$command {} [self] $command
-        }
-        my ImportCommands
+        set ScriptNamespace [my CreateScriptNamespace]
     }
 
-    # The object namespace (including script commands/variables) is removed by
-    # TclOO. Borrowed sources and their result vectors deliberately survive.
-    method ImportCommands {} {
-        # Imports the configured exported commands into this evaluator's script namespace.
+    method CheckIdle {operation} {
+        # Rejects operations that would replace or mutate an active evaluator environment.
+        # operation - Operation name included in the error message.
         #
-        # Internal constructor helper. Requires literal fully qualified names and checks local name collisions
+        # Internal method. Call before setting a busy state or entering the finally block that clears it.
+        # Returns: Nothing when idle; a structured busy error otherwise.
+        if {$Busy ne {}} {
+            return -code error -errorcode {SPICETRACESURFER EVALUATOR BUSY}\
+                    "Cannot $operation while evaluator is $Busy"
+        }
+    }
+    method destroy {} {
+        # Destroys an idle evaluator's script environment without destroying borrowed sources or results.
+        #
+        # Returns: Nothing. Destruction is rejected during evaluation and reset.
+        my CheckIdle destroy
+        set Busy destroying
+        next
+    }
+    method CreateScriptNamespace {} {
+        # Builds a fresh script namespace with evaluator aliases and configured extension imports.
+        #
+        # Internal method shared by construction and reset. Does not change the active ScriptNamespace.
+        # On initialization failure the candidate is removed and the previous environment remains active.
+        # Returns: The new fully qualified namespace, owned by the evaluator.
+        while {1} {
+            set candidate [info object namespace [self]]::script[incr NamespaceSerial]
+            if {![namespace exists $candidate]} {
+                break
+            }
+        }
+        namespace eval $candidate {}
+        try {
+            foreach command {trace derive publish} {
+                interp alias {} ${candidate}::$command {} [self] $command
+            }
+            my ImportCommands $candidate
+            return $candidate
+        } on error {message options} {
+            namespace delete $candidate
+            return -options $options $message
+        }
+    }
+    method reset {} {
+        # Replaces the scripting environment while retaining attachments, configuration and published results.
+        #
+        # Removes script variables, helper procedures, user-added imports and commands residing in the old
+        # namespace, including temporary vectors. Restores evaluator aliases and configured imports. The result
+        # vector-name counter is preserved. Initialization failure preserves the old environment. Arbitrary
+        # after callbacks and resources created outside the script namespace are not tracked or canceled.
+        # Returns: This Evaluator object. Reset is rejected while evaluating or already resetting.
+        my CheckIdle reset
+        set Busy resetting
+        try {
+            set replacement [my CreateScriptNamespace]
+            set previous $ScriptNamespace
+            set ScriptNamespace $replacement
+            namespace delete $previous
+            return [self]
+        } finally {
+            set Busy {}
+        }
+    }
+    method ImportCommands {target} {
+        # Imports the configured exported commands into a prepared script namespace.
+        # target - Fully qualified destination namespace created by CreateScriptNamespace.
+        #
+        # Internal initialization helper. Requires literal fully qualified names and checks local name collisions
         # before importing. Uses namespace import without -force, then verifies an import actually occurred:
         # Tcl silently ignores existing commands that are not exported by their namespace.
-        # Returns: Nothing. Any invalid import raises an error and aborts evaluator construction.
+        # Returns: Nothing. An invalid import aborts construction or replacement environment preparation.
         set names [dict create trace 1 derive 1 publish 1]
         foreach command $Imports {
             if {![string match ::* $command] || [regexp {[*?\[\]]} $command]} {
@@ -1469,8 +1567,8 @@ oo::configurable create ::spicetracesurfer::Evaluator {
                 return -code error "Import name '$tail' conflicts with an evaluator command or another import"
             }
             dict set names $tail 1
-            namespace eval $ScriptNamespace [list ::namespace import $command]
-            if {[namespace which -command ${ScriptNamespace}::$tail] eq {}} {
+            namespace eval $target [list ::namespace import $command]
+            if {[namespace which -command ${target}::$tail] eq {}} {
                 return -code error "Import command '$command' is not exported by its namespace"
             }
         }
@@ -1501,9 +1599,10 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         # -name - alias: Optional attachment alias; defaults to the source's current name.
         #
         # Defaults to the source's current name. Empty or already attached aliases are rejected. No data is copied or
-        # loaded, and changing the source name later does not change this alias.
+        # loaded, and changing the source name later does not change this alias. Requires an idle evaluator.
         # Synopsis: source ?-name alias?
         # Returns: The attachment alias.
+        my CheckIdle attach
         set arguments [argparse -inline -pfirst {
             source
             -name=
@@ -1526,8 +1625,9 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         # Removes an attachment without destroying its source.
         # alias - Attached source alias.
         #
-        # The designated result alias cannot be detached. Unknown aliases raise an error.
+        # The designated result alias cannot be detached. Unknown aliases raise an error. Requires an idle evaluator.
         # Returns: No public result.
+        my CheckIdle detach
         if {$alias eq $ResultAlias} {
             return -code error {Cannot detach the result source alias}
         }
@@ -1550,8 +1650,16 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         # Variables and helper procedures survive subsequent calls. The trace, derive and publish commands forward to
         # this evaluator's methods. Errors propagate; earlier script side effects are not rolled back. Execution is
         # synchronous in the application's interpreter.
+        # Errors preserve script definitions and completed results. The busy guard is cleared for every completion
+        # code; reset, destroy, attachment changes and nested evaluate calls are rejected until evaluation returns.
         # Returns: The script result, subject to normal Tcl completion semantics.
-        namespace eval $ScriptNamespace $script
+        my CheckIdle evaluate
+        set Busy evaluating
+        try {
+            namespace eval $ScriptNamespace $script
+        } finally {
+            set Busy {}
+        }
     }
     method trace {args} {
         # Resolves an attached waveform and returns its vector.

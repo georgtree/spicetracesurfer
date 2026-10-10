@@ -1,0 +1,185 @@
+# Lifecycle tests use the real data model; only reload phases are instrumented for guard probes.
+package require Tcl 9.0-
+package require tcltest 2
+namespace import ::tcltest::*
+set projectDir [file dirname [file dirname [file normalize [info script]]]]
+lappend auto_path $projectDir [file join $projectDir lib]
+package require spicetracesurfer
+namespace eval ::resettest {variable objects {}; variable duringReset {}}
+proc ::resettest::new {class args} {
+    set o [::spicetracesurfer::$class new {*}$args]
+    lappend ::resettest::objects $o
+    return $o
+}
+proc ::resettest::setup {args} {
+    set source [new DataSource result calculation]
+    return [list $source [new Evaluator -resultsource $source {*}$args]]
+}
+proc ::resettest::cleanup {} {
+    foreach o [lreverse $::resettest::objects] {
+        if {[info object isa object $o]} {catch {$o destroy}}
+    }
+    set ::resettest::objects {}
+}
+proc ::resettest::onUnset {e args} {
+    set ::resettest::duringReset [list [catch {$e reset}] [catch {$e evaluate {set a 1}}] [catch {$e destroy}]]
+}
+namespace eval ::resettest::extension {
+    namespace export helper
+    proc helper {} {return ok}
+}
+
+test evaluator-reset-1.1 {nested operations reject without clearing outer evaluation guard} -body {
+    lassign [::resettest::setup -imports {}] ds e
+    set calls [list [list $e evaluate {}] [list $e reset] [list $e destroy] [list $e attach $ds -name other]\
+                       [list $e detach results] [list $e evaluate {}]]
+    set script [list set calls $calls]
+    append script {; set codes {}; foreach call $calls {catch $call message options; lappend codes [dict get $options -errorcode]}; set codes}
+    set codes [$e evaluate $script]
+    list [llength $codes] [lsort -unique $codes] [$e evaluate {expr {2+2}}]
+} -cleanup {::resettest::cleanup} -result {6 {{SPICETRACESURFER EVALUATOR BUSY}} 4}
+
+test evaluator-reset-1.2 {script errors preserve definitions and Tcl error options} -body {
+    lassign [::resettest::setup -imports {}] ds e
+    set code [catch {$e evaluate {
+        set retained 9
+        proc helper {} {
+            return 17
+        }
+        error deliberate {} {TEST SCRIPT ERROR}
+    }} message options]
+    list $code $message [dict get $options -errorcode] [string match *deliberate* [dict get $options -errorinfo]]\
+            [$e evaluate {list $retained [helper]}]
+} -cleanup {::resettest::cleanup} -result {1 deliberate {TEST SCRIPT ERROR} 1 {9 17}}
+
+test evaluator-reset-1.3 {reset removes state and repairs aliases while retaining attachments and metadata traces}\
+        -body {
+    lassign [::resettest::setup] ds e
+    set tr [::resettest::new Trace retained voltage $ds]
+    $ds addTrace $tr
+    set input [::resettest::new DataSource input calculation]
+    $e attach $input
+    set before [$e getSources]
+    set old [$e evaluate {
+        set local 1
+        proc helper {} {
+            return 1
+        }
+        rename trace {}
+        proc trace {args} {
+            return damaged
+        }
+        namespace current
+    }]
+    set same [expr {[$e reset] eq $e}]
+    set state [$e evaluate {list [info exists local] [info commands [namespace current]::helper]\
+                                    [namespace import] [lindex [interp alias {} [namespace current]::trace] end]}]
+    list $same $state [namespace exists $old] [expr {$before eq [$e getSources]}]\
+            [expr {[$ds getTrace retained] eq $tr}]
+} -cleanup {::resettest::cleanup} -result {1 {0 {} measure trace} 0 1 1}
+
+test evaluator-reset-1.4 {failed replacement initialization preserves old environment and clears guard} -body {
+    lassign [::resettest::setup -imports {::resettest::extension::helper}] ds e
+    set old [$e evaluate {set retained 8; namespace current}]
+    # Removing an export prevents future imports but does not delete the existing import.
+    namespace eval ::resettest::extension {namespace export -clear}
+    set code [catch {$e reset}]
+    set children [namespace children [info object namespace $e]]
+    set intact [$e evaluate {list $retained [helper]}]
+    namespace eval ::resettest::extension {namespace export helper}
+    $e reset
+    list $code $intact [expr {$children eq [list $old]}] [$e evaluate {helper}]
+} -cleanup {
+    namespace eval ::resettest::extension {namespace export helper}
+    ::resettest::cleanup
+} -result {1 {8 ok} 1 ok}
+
+test evaluator-reset-1.5 {reset guard remains active during old-namespace variable cleanup} -body {
+    lassign [::resettest::setup -imports {}] ds e
+    $e evaluate [list set callback [list ::resettest::onUnset $e]]
+    $e evaluate {set value 1; ::trace add variable value unset $callback}
+    $e reset
+    list $::resettest::duringReset [$e evaluate {expr {3+4}}]
+} -cleanup {::resettest::cleanup} -result {{1 1 1} 7}
+
+test evaluator-reset-1.6 {return and break completions do not leave evaluator busy} -body {
+    lassign [::resettest::setup -imports {}] ds e
+    set value [$e evaluate {
+        return returned
+    }]
+    catch {$e evaluate {break}}
+    list $value [$e evaluate {expr {4+4}}]
+} -cleanup {::resettest::cleanup} -result {returned 8}
+
+# A real DataSource instance with instrumented acquisition phases isolates lifecycle checks from file I/O.
+proc ::resettest::probeSource {} {
+    set source [new DataSource probe calculation]
+    $source configure -type file -filetype csv -filepath unused
+    oo::objdefine $source {
+        ::oo::objdefine::variable ProbeLog FailPhase
+        ::oo::objdefine::method Probe {phase} {
+            lappend ProbeLog [list $phase [catch {my reload}] [catch {my destroy}]]
+            if {[info exists FailPhase] && $phase eq $FailPhase} {
+                error "failure in $phase"
+            }
+        }
+        ::oo::objdefine::method StageFile {} {
+            my Probe stage
+            my NewStage
+        }
+        ::oo::objdefine::method CommitStage {stageVar} {
+            my Probe commit
+        }
+        ::oo::objdefine::method DisposeStage {stage} {
+            next $stage
+            my Probe cleanup
+        }
+        ::oo::objdefine::method getLog {} {
+            return $ProbeLog
+        }
+        ::oo::objdefine::method failAt {phase} {
+            set FailPhase $phase
+        }
+    }
+    return $source
+}
+
+test source-reload-guard-2.1 {nested reload and destroy rejected through staging commit and cleanup} -body {
+    set source [::resettest::probeSource]
+    $source reload
+    set log [$source getLog]
+    $source destroy
+    list $log [info object isa object $source]
+} -cleanup {::resettest::cleanup} -result {{{stage 1 1} {commit 1 1} {cleanup 1 1}} 0}
+
+test source-reload-guard-2.2 {every reload failure releases guard for retry and destruction} -body {
+    set output {}
+    foreach phase {stage commit cleanup} {
+        set source [::resettest::probeSource]
+        $source failAt $phase
+        set failed [catch {$source reload}]
+        $source failAt {}
+        set retry [catch {$source reload}]
+        lappend output [list $failed $retry [catch {$source destroy}]]
+    }
+    set output
+} -cleanup {::resettest::cleanup} -result {{1 0 0} {1 0 0} {1 0 0}}
+
+testConstraint resetVectors [expr {![catch {package require rbc::vector 0.8.1}]}]
+test evaluator-reset-3.1 {reset preserves published vectors and serial but deletes local temporary vector} \
+    -constraints resetVectors -body {
+    lassign [::resettest::setup -imports {}] ds e
+    set tr [$e evaluate {derive first {2+3}}]
+    set v [$tr getVector]
+    set serial [set [info object namespace $e]::Serial]
+    set temp [$e evaluate {rbc::vector create [namespace current]::temporary -variable {}}]
+    $e reset
+    set preservedSerial [set [info object namespace $e]::Serial]
+    set other [$e evaluate {derive second {3+4}}]
+    list [expr {[$ds getTrace first] eq $tr}] [$v range 0 end] [expr {$temp ni [rbc::vector names]}]\
+            [expr {$serial eq $preservedSerial}] [expr {[$other getVector] ne $v}] [[$other getVector] range 0 end]
+} -cleanup {::resettest::cleanup} -result {1 5.0 1 1 1 7.0}
+
+::resettest::cleanup
+namespace delete ::resettest
+cleanupTests
