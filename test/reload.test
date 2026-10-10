@@ -1,0 +1,338 @@
+# File metadata, ownership and transactional reload regression tests.
+package require Tcl 9.0-
+package require tcltest 2
+namespace import ::tcltest::*
+set projectDir [file dirname [file dirname [file normalize [info script]]]]
+lappend auto_path $projectDir [file join $projectDir lib]
+package require spicetracesurfer
+namespace eval ::reloadtest {variable objects {}; variable files {}}
+proc ::reloadtest::new {class args} {
+    set o [::spicetracesurfer::$class new {*}$args]
+    lappend ::reloadtest::objects $o
+    return $o
+}
+proc ::reloadtest::write {path text} {
+    set ch [open $path w]
+    try {puts $ch $text} finally {close $ch}
+}
+proc ::reloadtest::csv {text} {
+    set path [::tcltest::makeFile $text reload-input.csv]
+    lappend ::reloadtest::files $path
+    set source [new DataSource input file -filetype csv -filepath $path -csvbatchsize 1]
+    return [list $source $path]
+}
+proc ::reloadtest::raw {value} {
+    return "Title: reload test\nDate: test\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\nNo. Points: 1\nVariables:\n0 time time\n1 v(out) voltage\nValues:\n0 0\n  $value"
+}
+proc ::reloadtest::cleanup {} {
+    foreach o $::reloadtest::objects {
+        if {[info object isa object $o]} {catch {$o destroy}}
+    }
+    foreach f $::reloadtest::files {::tcltest::removeFile $f}
+    set ::reloadtest::objects {}
+    set ::reloadtest::files {}
+}
+
+test reload-metadata-1.1 {source duplicate rejection leaves both traces alive} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set a [::reloadtest::new Trace x voltage $ds]
+    set b [::reloadtest::new Trace x current $ds]
+    $b configure -rawplot sentinel
+    $ds addTrace $a
+    set code [catch {$ds addTrace $b}]
+    list $code [expr {[$ds getTrace x] eq $a}] [info object isa object $b] [$b configure -rawplot]
+} -cleanup {::reloadtest::cleanup} -result {1 1 1 sentinel}
+
+test reload-metadata-1.2 {same object registration is a no-op} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set a [::reloadtest::new Trace x voltage $ds]
+    $ds addTrace $a
+    $ds addTrace $a
+    dict size [$ds getTraces]
+} -cleanup {::reloadtest::cleanup} -result 1
+
+test reload-metadata-1.3 {plot duplicate rejection leaves incoming metadata intact} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set plot [::reloadtest::new RawPlot plot0 0 $ds]
+    set a [::reloadtest::new Trace x voltage $ds]
+    set b [::reloadtest::new Trace x voltage $ds]
+    $b configure -rawplot {}
+    $plot addTrace $a
+    set code [catch {$plot addTrace $b}]
+    list $code [expr {[$plot getTrace x] eq $a}] [$b configure -rawplot]
+} -cleanup {::reloadtest::cleanup} -result {1 1 {}}
+
+test reload-metadata-1.4 {collection rejection does not alter the new trace} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    namespace eval [info object namespace $ds] {my SealFileData}
+    set tr [::reloadtest::new Trace x voltage $ds]
+    set code [catch {$ds addTrace $tr}]
+    list $code [dict size [$ds getTraces]] [info object isa object $tr]
+} -cleanup {::reloadtest::cleanup} -result {1 0 1}
+
+test reload-metadata-1.5 {sealed trace rejects all protected property assignments} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set tr [::reloadtest::new Trace x voltage $ds]
+    $ds addTrace $tr
+    namespace eval [info object namespace $ds] {my SealFileData}
+    set codes {}
+    foreach {prop value} {name y type current vector other numtype complex length 7 source bogus rawplot bogus} {
+        lappend codes [catch {$tr configure -$prop $value}]
+    }
+    $tr configure -axis x2
+    list $codes [$tr configure -axis] [$tr configure -name]
+} -cleanup {::reloadtest::cleanup} -result {{1 1 1 1 1 1 1} x2 x}
+
+test reload-metadata-1.6 {sealed plot rejects mutation, membership and direct destruction} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set plot [::reloadtest::new RawPlot p 0 $ds]
+    set tr [::reloadtest::new Trace x voltage $ds]
+    namespace eval [info object namespace $plot] {my SealFileData}
+    set codes {}
+    foreach {prop value} {name q index 2 source bogus} {lappend codes [catch {$plot configure -$prop $value}]}
+    lappend codes [catch {$plot addTrace $tr}] [catch {$plot destroy}]
+    namespace eval [info object namespace $plot] {my DisposeOwned}
+    set codes
+} -cleanup {::reloadtest::cleanup} -result {1 1 1 1 1}
+
+test reload-metadata-1.7 {owner can dispose protected traces} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set tr [::reloadtest::new Trace x voltage $ds]
+    $ds addTrace $tr
+    namespace eval [info object namespace $ds] {my SealFileData}
+    set code [catch {$tr destroy}]
+    $ds destroy
+    list $code [info object isa object $tr]
+} -cleanup {::reloadtest::cleanup} -result {1 0}
+
+test reload-metadata-1.8 {calculation sources cannot reload} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    $ds reload
+} -cleanup {::reloadtest::cleanup} -returnCodes error -result {Reload requires a RAW or CSV file source}
+
+test reload-metadata-1.9 {plot registration of same object is a no-op after locking} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set p [::reloadtest::new RawPlot p 0 $ds]
+    set tr [::reloadtest::new Trace x voltage $ds]
+    $p addTrace $tr
+    namespace eval [info object namespace $p] {my SealFileData}
+    $p addTrace $tr
+    set count [dict size [$p getTraces]]
+    namespace eval [info object namespace $p] {my DisposeOwned}
+    set count
+} -cleanup {::reloadtest::cleanup} -result 1
+
+test reload-metadata-1.10 {direct source registration cannot acquire a plot-owned trace} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set p [::reloadtest::new RawPlot p 0 $ds]
+    set tr [::reloadtest::new Trace x voltage $ds]
+    $p addTrace $tr
+    set code [catch {$ds addTrace $tr}]
+    list $code [dict size [$ds getTraces]] [expr {[$tr configure -rawplot] eq $p}]
+} -cleanup {::reloadtest::cleanup} -result {1 0 1}
+
+test reload-metadata-1.11 {plot registration cannot acquire a directly owned trace} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set p [::reloadtest::new RawPlot p 0 $ds]
+    set tr [::reloadtest::new Trace x voltage $ds]
+    $ds addTrace $tr
+    set code [catch {$p addTrace $tr}]
+    list $code [dict size [$p getTraces]] [$tr configure -rawplot]
+} -cleanup {::reloadtest::cleanup} -result {1 0 {}}
+
+test reload-metadata-1.12 {RAW change check accepts unchanged file and detects size change} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set path [makeFile abc reload-signature.raw]
+    lappend ::reloadtest::files $path
+    set ns [info object namespace $ds]
+    set ${ns}::RawPath $path
+    namespace eval $ns {set RawFileStamp [my RawSignature]}
+    set unchanged [catch {namespace eval $ns {my CheckRawUnchanged}}]
+    ::reloadtest::write $path abcdef
+    set changed [catch {namespace eval $ns {my CheckRawUnchanged}} msg opts]
+    list $unchanged $changed [dict get $opts -errorcode]
+} -cleanup {::reloadtest::cleanup} -result {0 1 {SPICETRACESURFER RAW CHANGED}}
+
+test reload-metadata-1.13 {RAW change check rejects unavailable path} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set path [makeFile abc reload-signature.raw]
+    lappend ::reloadtest::files $path
+    set ns [info object namespace $ds]
+    set ${ns}::RawPath $path
+    namespace eval $ns {set RawFileStamp [my RawSignature]}
+    file delete $path
+    set code [catch {namespace eval $ns {my CheckRawUnchanged}} msg opts]
+    list $code [dict get $opts -errorcode]
+} -cleanup {::reloadtest::cleanup} -result {1 {SPICETRACESURFER RAW CHANGED}}
+
+test reload-metadata-1.14 {merge preserves matching trace metadata and transfers ownership of additions} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set staged [::reloadtest::new DataSource stage calculation]
+    foreach {owner names} [list $ds {keep gone} $staged {keep added}] {
+        foreach name $names {$owner addTrace [::reloadtest::new Trace $name voltage $owner]}
+        namespace eval [info object namespace $owner] {my SealFileData}
+    }
+    set old [$ds getTrace keep]
+    set removed [$ds getTrace gone]
+    $old configure -axis y2
+    set ns [info object namespace $ds]
+    namespace eval $ns [list my MergeTraces $ds $staged]
+    set added [$ds getTrace added]
+    $staged destroy
+    list [expr {[$ds getTrace keep] eq $old}] [$old configure -axis] \
+        [info object isa object $removed] [info object isa object $added] \
+        [expr {[$added configure -source] eq $ds}] [$added configure -rawplot]
+} -cleanup {::reloadtest::cleanup} -result {1 y2 0 1 1 {}}
+
+test reload-metadata-1.15 {plot merge transfers added trace to surviving plot and source} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set staged [::reloadtest::new DataSource stage calculation]
+    set p [::reloadtest::new RawPlot p 0 $ds]
+    set q [::reloadtest::new RawPlot p 0 $staged]
+    set tr [::reloadtest::new Trace x voltage $staged]
+    $q addTrace $tr
+    namespace eval [info object namespace $q] {my SealFileData}
+    namespace eval [info object namespace $ds] [list my MergeTraces $p $q]
+    namespace eval [info object namespace $q] {my DisposeOwned}
+    list [expr {[$p getTrace x] eq $tr}] [expr {[$tr configure -rawplot] eq $p}] \
+        [expr {[$tr configure -source] eq $ds}] [catch {$tr configure -name y}]
+} -cleanup {::reloadtest::cleanup} -result {1 1 1 1}
+
+test reload-file-2.1 {CSV vectors are readonly but usable as expression inputs} -body {
+    lassign [::reloadtest::csv "x\n1\n2"] ds path
+    set v [[$ds getTrace x] getVector]
+    set code [catch {$v set {8}} msg opts]
+    list [$v readonly] $code [dict get $opts -errorcode] [rbc::vector expr "$v * 2"]
+} -cleanup {::reloadtest::cleanup} -result {1 1 {RBC VECTOR READONLY} {2.0 4.0}}
+
+test reload-file-2.2 {successful CSV reload changes schema and invalidates old objects} -body {
+    lassign [::reloadtest::csv "x\n1"] ds path
+    set old [$ds getTrace x]
+    set oldvec [$old getVector]
+    ::reloadtest::write $path "y,z\n3,4\n5,6"
+    set same [expr {[$ds reload] eq $ds}]
+    set tr [$ds getTrace y]
+    list $same [dict keys [$ds getTraces]] [info object isa object $old] \
+        [expr {$oldvec ni [rbc::vector names]}] [[$tr getVector] range 0 end] \
+        [expr {[$tr configure -source] eq $ds}] [[$tr getVector] readonly]
+} -cleanup {::reloadtest::cleanup} -result {1 {y z} 0 1 {3.0 5.0} 1 1}
+
+test reload-file-2.3 {failed CSV reload retains object identity, samples and registry} -body {
+    lassign [::reloadtest::csv "x\n1\n2"] ds path
+    set old [$ds getTrace x]
+    set v [$old getVector]
+    set before [lsort [rbc::vector names]]
+    ::reloadtest::write $path "x\n8\ninvalid"
+    set code [catch {$ds reload}]
+    list $code [expr {[$ds getTrace x] eq $old}] [$v range 0 end] \
+        [expr {$before eq [lsort [rbc::vector names]]}]
+} -cleanup {::reloadtest::cleanup} -result {1 1 {1.0 2.0} 1}
+
+test reload-file-2.4 {source acquisition settings are locked but display name is editable} -body {
+    lassign [::reloadtest::csv "x\n1"] ds path
+    set codes {}
+    foreach {key value} {type calculation filetype raw filepath other dialect generic csvbatchsize 2 csvdelimiter {;} csvencoding ascii csvheader false csvnametemplate v%d} {
+        lappend codes [catch {$ds configure -$key $value}]
+    }
+    $ds configure -name renamed
+    list $codes [[$ds getTrace x] configure -fullname]
+} -cleanup {::reloadtest::cleanup} -result {{1 1 1 1 1 1 1 1 1} renamed.x}
+
+test reload-file-2.5 {failed RAW reload preserves loaded data and rejects stale lazy reads} -body {
+    set path [makeFile [::reloadtest::raw 7] reload-input.raw]
+    lappend ::reloadtest::files $path
+    set ds [::reloadtest::new DataSource input file -filetype raw -filepath $path]
+    set plot [$ds getRawPlot plot0]
+    set tr [$plot getTrace v(out)]
+    set v [$tr getVector]
+    set timeTrace [$plot getTrace time]
+    ::reloadtest::write $path invalid
+    set code [catch {$ds reload}]
+    set stale [catch {$timeTrace getVector} msg opts]
+    list $code [expr {[$ds getRawPlot plot0] eq $plot}] \
+        [expr {[$tr getVector] eq $v}] [$v range 0 end] [$v readonly] \
+        $stale [dict get $opts -errorcode]
+} -cleanup {::reloadtest::cleanup} -result {1 1 1 7.0 1 1 {SPICETRACESURFER RAW CHANGED}}
+
+test reload-file-2.6 {RAW reload stays lazy and updates source references} -body {
+    set path [makeFile [::reloadtest::raw 7] reload-input.raw]
+    lappend ::reloadtest::files $path
+    set ds [::reloadtest::new DataSource input file -filetype raw -filepath $path]
+    set old [$ds getRawPlot plot0]
+    set oldTrace [$old getTrace v(out)]
+    ::reloadtest::write $path [::reloadtest::raw 9]
+    $ds reload
+    set plot [$ds getRawPlot plot0]
+    set tr [$plot getTrace v(out)]
+    set lazy 1
+    dict for {key trace} [$plot getTraces] {
+        if {[info exists [info object namespace $trace]::vector]} {set lazy 0}
+    }
+    list $lazy [expr {$plot eq $old}] [expr {$tr eq $oldTrace}] [expr {[$plot configure -source] eq $ds}] \
+        [expr {[$tr configure -source] eq $ds}] [[$tr getVector] range 0 end]
+} -cleanup {::reloadtest::cleanup} -result {1 1 1 1 1 9.0}
+
+test reload-file-2.7 {initial RAW opening uses original path and leaves all vectors unloaded} -body {
+    set path [makeFile [::reloadtest::raw 7] reload-input.raw]
+    lappend ::reloadtest::files $path
+    set ds [::reloadtest::new DataSource input file -filetype raw -filepath $path]
+    set ns [info object namespace $ds]
+    set lazy 1
+    dict for {key trace} [[$ds getRawPlot plot0] getTraces] {
+        if {[info exists [info object namespace $trace]::vector]} {set lazy 0}
+    }
+    list [expr {[set ${ns}::RawPath] eq [file normalize $path]}] $lazy
+} -cleanup {::reloadtest::cleanup} -result {1 1}
+
+test reload-file-2.8 {CSV reload retains vector identity and axis through reorder and length change} -body {
+    lassign [::reloadtest::csv "x,y\n1,2"] ds path
+    set tr [$ds getTrace x]
+    set v [$tr getVector]
+    $tr configure -axis y2
+    ::reloadtest::write $path "y,x,z\n20,10,30\n21,11,31"
+    $ds reload
+    set first [list [expr {[$ds getTrace x] eq $tr}] [expr {[$tr getVector] eq $v}] \
+        [$v range 0 end] [$v readonly] [$tr configure -axis]]
+    ::reloadtest::write $path "x\n12"
+    $ds reload
+    list $first [dict keys [$ds getTraces]] [expr {[$tr getVector] eq $v}] [$v range 0 end]
+} -cleanup {::reloadtest::cleanup} -result {{1 1 {10.0 11.0} 1 y2} x 1 12.0}
+
+test reload-file-2.9 {RAW reload updates loaded vector in place and leaves other trace lazy} -body {
+    set path [makeFile [::reloadtest::raw 7] reload-input.raw]
+    lappend ::reloadtest::files $path
+    set ds [::reloadtest::new DataSource input file -filetype raw -filepath $path]
+    set plot [$ds getRawPlot plot0]
+    set tr [$plot getTrace v(out)]
+    set v [$tr getVector]
+    set timeTrace [$plot getTrace time]
+    ::reloadtest::write $path [::reloadtest::raw 9]
+    $ds reload
+    list [expr {[$ds getRawPlot plot0] eq $plot}] [expr {[$plot getTrace v(out)] eq $tr}] \
+        [expr {[$tr getVector] eq $v}] [$v range 0 end] [$v readonly] \
+        [info exists [info object namespace $timeTrace]::vector]
+} -cleanup {::reloadtest::cleanup} -result {1 1 1 9.0 1 0}
+
+test reload-file-2.10 {numeric-type change preserves Trace but transfers replacement vector ownership} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set staged [::reloadtest::new DataSource stage calculation]
+    set tr [::reloadtest::new Trace x voltage $ds]
+    set replacement [::reloadtest::new Trace x voltage $staged]
+    set v [rbc::vector create [info object namespace $tr]::samples -variable {}]
+    set incoming [rbc::vector create [info object namespace $replacement]::samples -type complex -variable {}]
+    $tr configure -vector $v
+    $replacement configure -vector $incoming
+    $ds addTrace $tr
+    $staged addTrace $replacement
+    namespace eval [info object namespace $ds] {my SealFileData}
+    namespace eval [info object namespace $staged] {my SealFileData}
+    namespace eval [info object namespace $ds] [list my MergeTraces $ds $staged]
+    $staged destroy
+    set new [$tr getVector]
+    list [expr {[$ds getTrace x] eq $tr}] [expr {$new ne $v}] \
+        [expr {$v ni [rbc::vector names]}] [$new type] [$new readonly]
+} -cleanup {::reloadtest::cleanup} -result {1 1 1 complex 1}
+
+::reloadtest::cleanup
+namespace delete ::reloadtest
+cleanupTests

@@ -16,8 +16,8 @@ oo::configurable create ::spicetracesurfer::DataSource {
 
                 Use inherited `configure -property` to read a property and `configure -property value` to set it.
                 Construction and reconfiguration share the property setters. Invalid values leave that property's old
-                value intact; a multi-property configure call is not transactional. Changing file or CSV settings does
-                not reload existing data, change existing trace names, or rebuild indexes.
+                value intact; a multi-property configure call is not transactional. Loaded RAW/CSV acquisition
+                settings are locked. The source display name and trace axis association remain editable.
 
                 ## CSV input
                 CSV input defaults to UTF-8, comma-separated fields and a header in the first nonblank record. Header
@@ -49,9 +49,37 @@ oo::configurable create ::spicetracesurfer::DataSource {
                 ## Ownership
                 A source owns its directly registered traces and raw plots; each plot owns its traces, and each
                 trace owns its vector. Destroying the source destroys this owned data and closes a RAW reader.
-                Keep registered names stable: changing a child's name property does not rekey its owner's dictionary.
-                The low-level addTrace method replaces dictionary entries without destroying the previous object;
-                callers must prevent duplicates and avoid assigning the same vector to multiple owning traces.
+                addTrace rejects a different object with an existing name before changing either object; registering
+                the identical object again is a no-op. Failed registration leaves the incoming trace caller-owned.
+                A trace cannot be registered with two owners. Calculation metadata remains editable, but changing
+                a registered name does not rekey its dictionary.
+
+                ## File protection and reload
+                Loaded RAW/CSV sources lock type, filepath, filetype, dialect and all CSV settings. Their plot
+                names/indices/source links, trace metadata/vector references and collection membership are sealed.
+                Public destroy of sealed child objects is rejected; destroy the source or use reload instead.
+                CSV vectors are protected immediately and RAW vectors when first loaded, using RBC `readonly true`.
+                RBC 0.8.1 is required. This is accidental-change protection, not a security boundary: users can
+                deliberately unlock, rename or destroy an RBC vector or bypass TclOO setters via introspection.
+
+                `$source reload` stages replacement data, then updates matching plots and traces in place. Plots match
+                by plot key/index; traces match by local name, so CSV column reordering preserves identity. Matching
+                Trace objects retain axis assignments. Loaded same-type vectors are updated using dup and retain their
+                identity and graph connections. Numeric-type changes replace the vector only; reacquire that vector
+                reference and rebind its consumers. Added entries are created; removed entries are destroyed. Existing
+                calculation results are not recalculated. Source identity and acquisition settings are preserved.
+
+                CSV reload stages all samples. RAW reload stages metadata and samples only for matching traces with
+                loaded vectors; other traces remain lazy and sample errors may surface on a later getVector. Staging
+                failures preserve existing objects and loaded vectors. Temporary memory includes replacement data for
+                loaded traces. Commit-time copy/allocation errors do not roll back earlier updates, and notifications
+                are not batched across vectors. Protection is restored after each in-place copy, including errors.
+
+                RAW readers open the original file directly: there is no temporary copy. Keep that file unchanged while
+                using unloaded traces. Before and after lazy reads, file size, timestamps and available file identity
+                fields are checked; a detected change requires reload. These checks are best effort, not a content hash
+                or a guarantee against concurrent writes. A failed reload cannot restore overwritten file bytes, so
+                unloaded old traces may no longer be readable. Already loaded vectors remain usable.
             }
             propertydescriptions {
                 -name {
@@ -81,7 +109,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
                     convertfrom.
                 }
                 -csvheader {
-                    Tcl boolean indicating a header record; default true. Changing it does not reload the source.
+                    Tcl boolean indicating a header record; default true. Locked after file acquisition.
                 }
                 -csvnametemplate {
                     Tcl format template for headerless column names; default column%d. Receives a one-based index. The
@@ -101,6 +129,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
         }
     }
     property type -set {
+        my CheckMetadataWritable
         classvariable SourceTypes
         if {$value ni $SourceTypes} {
             return -code error "Source type '$value' is not one of the allowed types: [join $SourceTypes {, }]"
@@ -109,6 +138,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
         }
     }
     property filetype -set {
+        my CheckMetadataWritable
         classvariable FileTypes
         if {$type ne {file}} {
             return -code error "To set filetype type must be file, but type is '[my configure -type]'"
@@ -121,26 +151,33 @@ oo::configurable create ::spicetracesurfer::DataSource {
         }
     }
     property filepath -set {
+        my CheckMetadataWritable
         if {$type ne {file}} {
             return -code error "To set filepath type must be file, but type is '[my configure -type]'"
         } else {
             set filepath $value
         }
     }
-    property dialect
+    property dialect -set {
+        my CheckMetadataWritable
+        set dialect $value
+    }
     property csvbatchsize -set {
+        my CheckMetadataWritable
         if {![string is integer -strict $value] || $value <= 0} {
             return -code error {CSV batch size must be a positive integer}
         }
         set csvbatchsize $value
     }
     property csvdelimiter -set {
+        my CheckMetadataWritable
         if {[string length $value] != 1 || ![string is ascii -strict $value]} {
             return -code error {CSV delimiter must be a single ASCII character}
         }
         set csvdelimiter $value
     }
     property csvencoding -set {
+        my CheckMetadataWritable
         # Asking Tcl to convert an empty string validates the encoding name
         # without opening a file, and supports lazily loaded encodings.
         if {[catch {encoding convertfrom $value {}} message]} {
@@ -149,12 +186,14 @@ oo::configurable create ::spicetracesurfer::DataSource {
         set csvencoding $value
     }
     property csvheader -set {
+        my CheckMetadataWritable
         if {![string is boolean -strict $value]} {
             return -code error {CSV header flag must be a boolean}
         }
         set csvheader $value
     }
     property csvnametemplate -set {
+        my CheckMetadataWritable
         if {[catch {
             set firstName [format $value 1]
             set secondName [format $value 2]
@@ -177,6 +216,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
         variable FileTypes
         const FileTypes {raw csv touchstone}
     }
+    variable FileLocked RawFileStamp RawPath
     constructor {args} {
         # Constructs a source and acquires its initial data or metadata.
         # name - Nonempty source display name.
@@ -209,6 +249,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
             {-csvheader= -default true}
             {-csvnametemplate= -default column%d}
         }]
+        set FileLocked 0
         set Traces [dict create]
         set RawPlots [dict create]
         my configure -name [dict get $arguments name]
@@ -220,11 +261,20 @@ oo::configurable create ::spicetracesurfer::DataSource {
             my configure -filepath [dict get $arguments filepath]
             my configure -filetype [dict get $arguments filetype]
         }
-        if {($type eq {file}) && ($filetype eq {raw})} {
-            my configure -dialect [dict get $arguments dialect]
-            my CreateAndFillRaw
-        } elseif {($type eq {file}) && ($filetype eq {csv})} {
-            my CreateAndFillCsv
+        try {
+            if {($type eq {file}) && ($filetype eq {raw})} {
+                package require rbc::vector 0.8.1
+                my configure -dialect [dict get $arguments dialect]
+                my CreateAndFillRaw
+                my SealFileData
+            } elseif {($type eq {file}) && ($filetype eq {csv})} {
+                package require rbc::vector 0.8.1
+                my CreateAndFillCsv
+                my SealFileData
+            }
+        } on error {message options} {
+            my DisposeData
+            return -options $options $message
         }
     }
     destructor {
@@ -232,31 +282,174 @@ oo::configurable create ::spicetracesurfer::DataSource {
         #
         # Registered objects and vectors must not be shared between owners.
         # Returns: Nothing.
-        if {[info exists Traces]} {
-            if {$Traces ne {}} {
-                dict for {name trace} $Traces {
-                    $trace destroy
-                }
-            }
+        my DisposeData
+    }
+    method CheckMetadataWritable {} {
+        # Rejects changes to the acquisition settings of a loaded file source.
+        #
+        # Returns: Nothing on success; an error when metadata is locked.
+        if {[info exists FileLocked] && $FileLocked} {
+            return -code error {File source metadata is locked; use reload to reread its data}
         }
-        if {[info exists RawPlots]} {
-            if {$RawPlots ne {}} {
-                dict for {name rawPlot} $RawPlots {
-                    $rawPlot destroy
+    }
+    method DisposeData {} {
+        # Releases owned payload objects and the RAW reader, including partial loads.
+        #
+        # Internal cleanup is allowed to dispose locked children.
+        # Returns: Nothing.
+        foreach collection {Traces RawPlots} {
+            if {[info exists $collection]} {
+                dict for {key object} [set $collection] {
+                    if {[info object isa object $object]} {
+                        catch {namespace eval [info object namespace $object] {my DisposeOwned}}
+                    }
                 }
+                set $collection {}
             }
         }
         if {[info exists FileHandle]} {
-            $FileHandle close
+            catch {$FileHandle close}
+            unset FileHandle
+        }
+        unset -nocomplain RawFileStamp RawPath
+    }
+    method SealFileData {} {
+        # Locks registered metadata and any already loaded file vectors.
+        #
+        # Returns: Nothing.
+        dict for {key object} $Traces {
+            namespace eval [info object namespace $object] {my SealFileData}
+        }
+        dict for {key object} $RawPlots {
+            namespace eval [info object namespace $object] {my SealFileData}
+        }
+        set FileLocked 1
+    }
+    method reload {} {
+        # Stages replacement data before updating the source's owned objects.
+        #
+        # Matching plot keys and local trace names preserve object identity and axis assignments.
+        # Loaded matching vectors of the same numeric type are updated with dup and retain identity.
+        # A numeric-type change replaces the vector, requiring consumers to reacquire its reference.
+        # CSV stages all samples. RAW stages samples only for matching traces already loaded in this source;
+        # other traces stay lazy. All required reads finish before existing data is changed.
+        # Read failures preserve objects and loaded vectors, but cannot restore externally overwritten RAW bytes.
+        # Commit-time copy/allocation errors are propagated without rollback of earlier updates. Notifications
+        # are not batched across vectors. The owner restores vector protection even when a copy fails.
+        # Returns: This DataSource object.
+        if {$type ne {file} || $filetype ni {raw csv}} {
+            return -code error {Reload requires a RAW or CSV file source}
+        }
+        set options [list -filepath $filepath -filetype $filetype]
+        if {$filetype eq {raw}} {
+            lappend options -dialect $dialect
+        } else {
+            foreach option {csvbatchsize csvdelimiter csvencoding csvheader csvnametemplate} {
+                lappend options -$option [set $option]
+            }
+        }
+        set staged [::spicetracesurfer::DataSource new $name file {*}$options]
+        try {
+            set stagedNs [info object namespace $staged]
+            # Complete all required reads before touching current objects or vectors.
+            dict for {key replacement} [$staged getRawPlots] {
+                if {![dict exists $RawPlots $key]} {
+                    continue
+                }
+                set current [dict get $RawPlots $key]
+                dict for {traceName trace} [$current getTraces] {
+                    if {![dict exists [$replacement getTraces] $traceName]} {
+                        continue
+                    }
+                    set traceNs [info object namespace $trace]
+                    if {[info exists ${traceNs}::vector] && ([set ${traceNs}::vector] ne {})} {
+                        [dict get [$replacement getTraces] $traceName] getVector
+                    }
+                }
+            }
+            if {$filetype eq {raw}} {
+                namespace eval $stagedNs {my CheckRawUnchanged}
+            }
+            # Commit contains no sample reads. Copies can notify vector clients individually.
+            my MergeTraces [self] $staged
+            set incomingPlots [$staged getRawPlots]
+            dict for {key replacement} $incomingPlots {
+                if {[dict exists $RawPlots $key]} {
+                    set current [dict get $RawPlots $key]
+                    my MergeTraces $current $replacement
+                    set [info object namespace $current]::index [$replacement configure -index]
+                } else {
+                    namespace eval [info object namespace $replacement] [list my RebindSource [self]]
+                    dict set RawPlots $key $replacement
+                    dict unset ${stagedNs}::RawPlots $key
+                }
+            }
+            dict for {key current} $RawPlots {
+                if {![dict exists $incomingPlots $key]} {
+                    namespace eval [info object namespace $current] {my DisposeOwned}
+                    dict unset RawPlots $key
+                }
+            }
+            # Keep the replacement reader for all future lazy reads.
+            set oldHandle {}
+            if {[info exists FileHandle]} {
+                set oldHandle $FileHandle
+            }
+            foreach field {FileHandle RawFileStamp RawPath} {
+                if {[info exists ${stagedNs}::$field]} {
+                    set $field [set ${stagedNs}::$field]
+                    unset ${stagedNs}::$field
+                }
+            }
+            if {$oldHandle ne {}} {
+                catch {$oldHandle close}
+            }
+            return [self]
+        } finally {
+            $staged destroy
+        }
+    }
+    method MergeTraces {owner replacementOwner} {
+        # Commits a staged trace collection into an existing source or plot.
+        # owner - Surviving DataSource or RawPlot that owns the destination collection.
+        # replacementOwner - Staging object containing fully prepared replacement traces.
+        #
+        # Internal method. Updates matching traces, transfers new traces and disposes removed ones.
+        # Transferred objects are detached from staging immediately so its destructor cannot delete them.
+        # Returns: Nothing. Commit errors propagate and do not roll back earlier updates.
+        set ownerNs [info object namespace $owner]
+        set replacementNs [info object namespace $replacementOwner]
+        set incoming [$replacementOwner getTraces]
+        dict for {key replacement} $incoming {
+            if {[dict exists [set ${ownerNs}::Traces] $key]} {
+                set current [dict get [set ${ownerNs}::Traces] $key]
+                namespace eval [info object namespace $current] [list my UpdateFrom $replacement]
+            } else {
+                set traceNs [info object namespace $replacement]
+                namespace eval $traceNs [list my RebindSource [self]]
+                set ${traceNs}::rawplot [expr {$owner eq [self] ? {} : $owner}]
+                set ${traceNs}::RegistrationOwner $owner
+                dict set ${ownerNs}::Traces $key $replacement
+                dict unset ${replacementNs}::Traces $key
+            }
+        }
+        dict for {key current} [set ${ownerNs}::Traces] {
+            if {![dict exists $incoming $key]} {
+                namespace eval [info object namespace $current] {my DisposeOwned}
+                dict unset ${ownerNs}::Traces $key
+            }
         }
     }
     method CreateAndFillRaw {} {
         # Creates the RAW reader and populates plot and trace metadata.
         #
-        # Internal method. Uses filepath and dialect with vector output and collision errors enabled.  Stores the reader
-        # for subsequent lazy vector reads; does not read trace samples here.
+        # Internal method. Opens the original file with dialect, vector output and collision errors enabled.
+        # Stores the reader for lazy sample reads. No temporary copy or eager vector loading is performed.
+        # Records a normalized path and file signature for best-effort change detection.
         # Returns: No public result.
-        set FileHandle [tclsimrawreader::openraw -dialect $dialect -output vector -ifexists error $filepath]
+        set RawPath [file normalize $filepath]
+        set RawFileStamp [my RawSignature]
+        set FileHandle [tclsimrawreader::openraw -dialect $dialect -output vector -ifexists error $RawPath]
         set rawPlotsInfo [$FileHandle plots]
         foreach rawPlotInfo $rawPlotsInfo {
             set rawPlotIndex [dict get $rawPlotInfo index]
@@ -268,8 +461,39 @@ oo::configurable create ::spicetracesurfer::DataSource {
             foreach rawPlotVaribleInfo $rawPlotVariablesInfo {
                 set rawVariableName [dict get $rawPlotVaribleInfo name]
                 set traceObj [::spicetracesurfer::Trace new $rawVariableName [dict get $rawPlotVaribleInfo type] [self]]
-                $rawPlotObj addTrace $traceObj
+                try {
+                    $rawPlotObj addTrace $traceObj
+                } on error {message options} {
+                    $traceObj destroy
+                    return -options $options $message
+                }
             }
+        }
+        my CheckRawUnchanged
+    }
+    method RawSignature {} {
+        # Reads inexpensive filesystem metadata for the current RAW path.
+        #
+        # Internal method. Excludes access time, which reads may change. File identity fields are platform
+        # dependent and timestamps may have coarse resolution; this is not a content fingerprint.
+        # Returns: A list of available identity, size and timestamp fields; errors if the path is unavailable.
+        file stat $RawPath stat
+        set signature {}
+        foreach field {dev ino size mtime ctime} {
+            if {[info exists stat($field)]} {
+                lappend signature $field $stat($field)
+            }
+        }
+        return $signature
+    }
+    method CheckRawUnchanged {} {
+        # Rejects further lazy reads after a detected change to the RAW file.
+        #
+        # Internal method. Does not read file contents. Loaded vectors need no filesystem check.
+        # Returns: Nothing on success; an error if the path is missing or its signature differs.
+        if {[catch {my RawSignature} current] || $current ne $RawFileStamp} {
+            return -code error -errorcode {SPICETRACESURFER RAW CHANGED} \
+                {RAW file changed or is unavailable; reload the source before reading unloaded traces}
         }
     }
     method CreateAndFillCsv {} {
@@ -282,7 +506,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
         # tracked partial results.
         # Returns: No public result.
         if {[dict size $Traces] != 0} {
-            return -code error {CSV loading requires an empty trace collection}
+            error {CSV loading requires an empty trace collection}
         }
         set channel [open $filepath r]
         set reader {}
@@ -294,7 +518,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
             # Keep this reader alive: it may buffer data beyond the first row.
             set firstRows [$reader next 1]
             if {[llength $firstRows]==0} {
-                return -code error {CSV file has no records}
+                error {CSV file has no records}
             }
             set firstRow [lindex $firstRows 0]
             # Accept the common UTF-8 BOM, but preserve names otherwise.
@@ -316,11 +540,12 @@ oo::configurable create ::spicetracesurfer::DataSource {
             set seen {}
             foreach header $headers {
                 if {[string trim $header] eq {}} {
-                    return -code error {CSV column names must not be empty}
+                    error {CSV column names must not be empty}
                 }
                 if {[dict exists $seen $header]} {
-                    return -code error "Duplicate CSV column name '$header'"
-                }
+                    error "Duplicate CSV column name '$header'"
+                }
+
                 dict set seen $header 1
             }
             for {set i 0} {$i<$columnCount} {incr i} {
@@ -328,7 +553,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
                 # (e.g. v(2), spaces or ::) as vector-name syntax.
                 set vecName [info object namespace [self]]::csvColumn$i
                 if {[namespace which -command $vecName] ne {}} {
-                    return -code error "CSV vector command '$vecName' already exists"
+                    error "CSV vector command '$vecName' already exists"
                 }
                 lappend vectors [rbc::vector create $vecName -variable {}]
             }
@@ -346,13 +571,13 @@ oo::configurable create ::spicetracesurfer::DataSource {
                 foreach row $rows {
                     incr recordNumber
                     if {[llength $row] != $columnCount} {
-                        return -code error "CSV record $recordNumber has [llength $row] fields; expected $columnCount"
+                        error "CSV record $recordNumber has [llength $row] fields; expected $columnCount"
                     }
                     set i 0
                     foreach value $row {
                         set value [string trim $value]
                         if {![string is double -strict $value]} {
-                            return -code error "CSV record $recordNumber, column '[lindex $headers $i]':\
+                            error "CSV record $recordNumber, column '[lindex $headers $i]':\
                                     expected a number, got '$value'"
                         }
                         lappend columns($i) $value
@@ -372,6 +597,8 @@ oo::configurable create ::spicetracesurfer::DataSource {
             foreach header $headers vec $vectors {
                 set trace [::spicetracesurfer::Trace new -vector $vec -- $header unknown [self]]
                 lappend pendingTraces $trace
+                set vec [rbc::vector rename $vec [info object namespace $trace]::samples]
+                $trace configure -vector $vec
             }
             # Close input before committing ownership to the source.
             $reader destroy
@@ -409,11 +636,20 @@ oo::configurable create ::spicetracesurfer::DataSource {
         # namespace - Namespace prefix for the destination vector name.
         #
         # Requires a file source whose filetype is raw. The reader constructs namespace::name and uses its configured
-        # collision policy. Called by Trace.getVector for lazy loading.
+        # collision policy. Called by Trace.getVector for lazy loading. Checks the original file signature
+        # before and after reading; a detected change discards the new vector and requires reload.
         # Returns: The RBC vector name returned by the RAW reader.
         if {$type eq {file}} {
             if {$filetype eq {raw}} {
-                return [$FileHandle vector -plot $plot $name -name ${namespace}::$name]
+                my CheckRawUnchanged
+                set result [$FileHandle vector -plot $plot $name -name ${namespace}::$name]
+                try {
+                    my CheckRawUnchanged
+                } on error {message options} {
+                    catch {rbc::vector destroy $result}
+                    return -options $options $message
+                }
+                return $result
             } else {
                 return -code error "Raw vector cannot be readed because file type of data source is not raw"
             }
@@ -440,11 +676,34 @@ oo::configurable create ::spicetracesurfer::DataSource {
         # Registers a trace directly under this source and clears its rawplot property.
         # trace - Trace object to register, indexed by its current name.
         #
-        # The caller must supply a trace with the correct source and unique ownership. Existing
-        # entries with the same name are replaced without destroying their former trace object.
+        # Rejects a different trace with the same name without changing either object. Re-registering
+        # the identical object is a no-op. New membership requires editable metadata and matching source.
+        # Failed registration leaves the incoming object caller-owned; existing traces are never destroyed.
         # Returns: No public result.
-        dict set Traces [$trace configure -name] $trace
+        if {![info object isa typeof $trace ::spicetracesurfer::Trace]} {
+            error {Expected a live Trace object}
+        }
+        set key [$trace configure -name]
+        if {[dict exists $Traces $key]} {
+            if {[dict get $Traces $key] eq $trace} {return}
+            error "Trace '$key' already exists"
+        }
+        my CheckMetadataWritable
+        if {[$trace configure -source] ne [self]} {
+            error {Trace belongs to a different data source}
+        }
+        set traceNs [info object namespace $trace]
+        if {[info exists ${traceNs}::RegistrationOwner] &&
+            [set ${traceNs}::RegistrationOwner] ne [self]} {
+            error {Trace is already registered with another owner}
+        }
+        if {[info exists ${traceNs}::rawplot] && [set ${traceNs}::rawplot] ne {} &&
+            [set ${traceNs}::rawplot] ne {}} {
+            error {Trace already belongs to a different raw plot}
+        }
         $trace configure -rawplot {}
+        set ${traceNs}::RegistrationOwner [self]
+        dict set Traces $key $trace
     }
     method getTrace {name} {
         # Looks up a directly owned trace.
@@ -475,9 +734,10 @@ oo::configurable create ::spicetracesurfer::RawPlot {
                 vectors. A plot's fullname combines its source name and local plot name for display; it is not an
                 unambiguous serialization of unrestricted hierarchical names.
 
-                Destroying the plot destroys its registered traces. The source owns registered plots; do not destroy
-                one independently while leaving it registered. Keep registered trace names stable, and prevent multiple
-                owners for a trace or vector.
+                Loaded file plots have locked names, indices, source references and trace membership. Public destroy
+                is rejected after sealing. Source destruction or reload disposes plots and their registered traces.
+                A duplicate trace name is rejected; registering the same object again is a no-op. Trace and vector
+                ownership must be unique.
             }
             propertydescriptions {
                 -name {
@@ -496,9 +756,16 @@ oo::configurable create ::spicetracesurfer::RawPlot {
             }
         }
     }
-    property name
-    property index
+    property name -set {
+        my CheckMetadataWritable
+        set name $value
+    }
+    property index -set {
+        my CheckMetadataWritable
+        set index $value
+    }
     property source -set {
+        my CheckMetadataWritable
         if {![info object class $value ::spicetracesurfer::DataSource]} {
             return -code error "Source must be an object of class ::spicetracesurfer::DataSource"
         } else {
@@ -508,7 +775,30 @@ oo::configurable create ::spicetracesurfer::RawPlot {
     property fullname -kind readable -get {
         return "[$source configure -name].$name"
     }
-    variable name fullname source Traces
+    variable name fullname source index Traces
+    variable FileLocked
+    method CheckMetadataWritable {} {
+        # Rejects public metadata or membership changes after file data is sealed.
+        #
+        # Returns: Nothing on success.
+        if {[info exists FileLocked] && $FileLocked} {
+            error {File-backed metadata is locked}
+        }
+    }
+    method destroy {} {
+        # Destroys an editable object. Locked file children are disposed by their source.
+        #
+        # Returns: Nothing.
+        my CheckMetadataWritable
+        next
+    }
+    method DisposeOwned {} {
+        # Allows the owner to release this object during source destruction or reload.
+        #
+        # Returns: Nothing.
+        set FileLocked 0
+        my destroy
+    }
     constructor {args} {
         # Constructs metadata for a RAW plot with an empty trace collection.
         # name - Local plot name, normally plot followed by its index.
@@ -534,7 +824,7 @@ oo::configurable create ::spicetracesurfer::RawPlot {
         if {[info exists Traces]} {
             if {$Traces ne {}} {
                 dict for {name trace} $Traces {
-                    $trace destroy
+                    namespace eval [info object namespace $trace] {my DisposeOwned}
                 }
             }
         }
@@ -543,11 +833,53 @@ oo::configurable create ::spicetracesurfer::RawPlot {
         # Registers a trace and assigns this plot as its rawplot.
         # trace - Trace object indexed by its current name.
         #
-        # The caller is responsible for source consistency and unique ownership. Duplicate names replace dictionary
-        # entries without destroying the previous trace.
+        # Duplicate names belonging to another object are errors; registering the same object is a no-op.
+        # Rejects changes to a sealed file plot and mismatched or already registered owners before mutation.
+        # On failure the incoming trace remains caller-owned and unchanged.
         # Returns: No public result.
-        dict set Traces [$trace configure -name] $trace
+        if {![info object isa typeof $trace ::spicetracesurfer::Trace]} {
+            error {Expected a live Trace object}
+        }
+        set key [$trace configure -name]
+        if {[dict exists $Traces $key]} {
+            if {[dict get $Traces $key] eq $trace} {return}
+            error "Trace '$key' already exists"
+        }
+        my CheckMetadataWritable
+        if {[$trace configure -source] ne $source} {
+            error {Trace belongs to a different data source}
+        }
+        set traceNs [info object namespace $trace]
+        if {[info exists ${traceNs}::RegistrationOwner] &&
+            [set ${traceNs}::RegistrationOwner] ne [self]} {
+            error {Trace is already registered with another owner}
+        }
+        if {[info exists ${traceNs}::rawplot] && [set ${traceNs}::rawplot] ne {} &&
+            [set ${traceNs}::rawplot] ne [self]} {
+            error {Trace already belongs to a different raw plot}
+        }
         $trace configure -rawplot [self]
+        set ${traceNs}::RegistrationOwner [self]
+        dict set Traces $key $trace
+    }
+    method SealFileData {} {
+        # Seals file metadata and all registered traces.
+        #
+        # Returns: Nothing.
+        dict for {key trace} $Traces {
+            namespace eval [info object namespace $trace] {my SealFileData}
+        }
+        set FileLocked 1
+    }
+    method RebindSource {owner} {
+        # Internally reassigns staging metadata to the surviving source on reload.
+        # owner - Destination DataSource object.
+        #
+        # Returns: Nothing.
+        set source $owner
+        dict for {key trace} $Traces {
+            namespace eval [info object namespace $trace] [list my RebindSource $owner]
+        }
     }
     method getTrace {name} {
         # Looks up a trace within this plot.
@@ -581,6 +913,9 @@ oo::configurable create ::spicetracesurfer::Trace {
                 sourceName.plotName.traceName. Names may contain dots and are display labels; evaluator lookup uses
                 separate source, plot and trace arguments instead of splitting a fullname.
 
+                File-backed traces reject changes to name, type, numtype, length, source, rawplot and vector after
+                loading. The owner may internally assign the first lazy RAW vector, already marked readonly.
+                Axis remains editable. Public destruction of sealed traces is rejected; their owner handles cleanup.
                 The trace destroys its assigned nonempty vector on destruction. Vector ownership must be unique. The
                 vector property is a low-level assignment: replacing it does not destroy the former vector. An unset
                 vector means not loaded; assigning an empty vector name is intended for ownership cleanup, not for
@@ -621,14 +956,20 @@ oo::configurable create ::spicetracesurfer::Trace {
             }
         }
     }
-    property name
+    property name -set {
+        my CheckMetadataWritable
+        set name $value
+    }
     property fullname -kind readable -get {
         if {[info exists rawplot] && $rawplot ne {}} {
             return "[$rawplot configure -fullname].$name"
         }
         return "[$source configure -name].$name"
     }
-    property type
+    property type -set {
+        my CheckMetadataWritable
+        set type $value
+    }
     property numtype -get {
         if {[info exists vector]} {
             return [$vector type]
@@ -636,13 +977,17 @@ oo::configurable create ::spicetracesurfer::Trace {
             return $numtype
         }
     } -set {
+        my CheckMetadataWritable
         if {[info exists vector]} {
             set numtype [$vector type]
         } else {
             set numtype $value
         }
     }
-    property vector
+    property vector -set {
+        my CheckMetadataWritable
+        set vector $value
+    }
     property length -get {
         if {[info exists vector]} {
             return [$vector length]
@@ -650,6 +995,7 @@ oo::configurable create ::spicetracesurfer::Trace {
             return $length
         }
     } -set {
+        my CheckMetadataWritable
         if {[info exists vector]} {
             set length [$vector length]
         } else {
@@ -657,15 +1003,42 @@ oo::configurable create ::spicetracesurfer::Trace {
         }
     }
     property source -set {
+        my CheckMetadataWritable
         if {![info object class $value ::spicetracesurfer::DataSource]} {
             return -code error "Source must be an object of class ::spicetracesurfer::DataSource"
         } else {
             set source $value
         }
     }
-    property rawplot
+    property rawplot -set {
+        my CheckMetadataWritable
+        set rawplot $value
+    }
     property axis
     variable name fullname type numtype length vector source rawplot axis
+    variable FileLocked RegistrationOwner
+    method CheckMetadataWritable {} {
+        # Rejects public metadata or membership changes after file data is sealed.
+        #
+        # Returns: Nothing on success.
+        if {[info exists FileLocked] && $FileLocked} {
+            error {File-backed metadata is locked}
+        }
+    }
+    method destroy {} {
+        # Destroys an editable object. Locked file children are disposed by their source.
+        #
+        # Returns: Nothing.
+        my CheckMetadataWritable
+        next
+    }
+    method DisposeOwned {} {
+        # Allows the owner to release this object during source destruction or reload.
+        #
+        # Returns: Nothing.
+        set FileLocked 0
+        my destroy
+    }
     constructor {args} {
         # Constructs a waveform descriptor, optionally taking ownership of an existing vector.
         # name - Local trace name.
@@ -697,6 +1070,54 @@ oo::configurable create ::spicetracesurfer::Trace {
             }
         }
     }
+    method SealFileData {} {
+        # Protects metadata and already loaded vector data using RBC readonly.
+        #
+        # Returns: Nothing.
+        if {[info exists vector] && $vector ne {}} {$vector readonly true}
+        set FileLocked 1
+    }
+    method RebindSource {owner} {
+        # Internally reassigns a staged trace to the surviving source on reload.
+        # owner - Destination DataSource object.
+        #
+        # Returns: Nothing.
+        if {[info exists RegistrationOwner] && $RegistrationOwner eq $source} {
+            set RegistrationOwner $owner
+        }
+        set source $owner
+    }
+    method UpdateFrom {replacement} {
+        # Updates this trace from a fully prepared staging trace without public metadata setters.
+        # replacement - Staging Trace with replacement metadata and any required samples already loaded.
+        #
+        # Internal owner operation. Preserves this object and its axis association. Same-type vectors are
+        # copied in place; different types transfer the staged vector into this object's namespace and
+        # destroy the old vector. An unloaded replacement keeps an unloaded destination lazy.
+        # Returns: Nothing. Copy failures restore readonly protection but do not undo prior source updates.
+        set replacementNs [info object namespace $replacement]
+        if {[info exists ${replacementNs}::vector] && [set ${replacementNs}::vector] ne {}} {
+            set incoming [set ${replacementNs}::vector]
+            if {[info exists vector] && $vector ne {} && [$vector type] eq [$incoming type]} {
+                $vector readonly false
+                try {
+                    $incoming dup $vector
+                } finally {
+                    $vector readonly true
+                }
+            } else {
+                # Object namespace numbers are unique, including across repeated reloads.
+                set adopted [rbc::vector rename $incoming [info object namespace [self]]::reload_[namespace tail $replacementNs]]
+                unset ${replacementNs}::vector
+                set previous {}
+                if {[info exists vector]} {set previous $vector}
+                set vector $adopted
+                if {$previous ne {}} {rbc::vector destroy $previous}
+            }
+        }
+        set type [$replacement configure -type]
+        unset -nocomplain numtype length
+    }
     method getVector {} {
         # Returns the assigned vector, lazily loading RAW samples when it is unset.
         #
@@ -707,8 +1128,14 @@ oo::configurable create ::spicetracesurfer::Trace {
         if {[info exists vector]} {
             return [my configure -vector]
         } else {
-            my configure -vector [[my configure -source] readRawVector [[my configure -rawplot] configure -index]\
-                                          [my configure -name] [self]]
+            set loaded [$source readRawVector [$rawplot configure -index] $name [info object namespace [self]]]
+            try {
+                if {[info exists FileLocked] && $FileLocked} {$loaded readonly true}
+            } on error {message options} {
+                rbc::vector destroy $loaded
+                return -options $options $message
+            }
+            set vector $loaded
             return $vector
         }
     }
