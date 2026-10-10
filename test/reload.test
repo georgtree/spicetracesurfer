@@ -165,38 +165,76 @@ test reload-metadata-1.13 {RAW change check rejects unavailable path} -body {
     list $code [dict get $opts -errorcode]
 } -cleanup {::reloadtest::cleanup} -result {1 {SPICETRACESURFER RAW CHANGED}}
 
-test reload-metadata-1.14 {merge preserves matching trace metadata and transfers ownership of additions} -body {
+test reload-metadata-1.14 {record merge preserves matching metadata and creates only added traces} -body {
     set ds [::reloadtest::new DataSource calc calculation]
-    set staged [::reloadtest::new DataSource stage calculation]
-    foreach {owner names} [list $ds {keep gone} $staged {keep added}] {
-        foreach name $names {$owner addTrace [::reloadtest::new Trace $name voltage $owner]}
-        namespace eval [info object namespace $owner] {my SealFileData}
-    }
+    foreach name {keep gone} {$ds addTrace [::reloadtest::new Trace $name voltage $ds]}
     set old [$ds getTrace keep]
     set removed [$ds getTrace gone]
     $old configure -axis y2
-    set ns [info object namespace $ds]
-    namespace eval $ns [list my MergeTraces $ds $staged]
+    set incoming [dict create keep {type current} added {type voltage}]
+    namespace eval [info object namespace $ds] [list my MergeTraces $ds $incoming]
     set added [$ds getTrace added]
-    $staged destroy
     list [expr {[$ds getTrace keep] eq $old}] [$old configure -axis] \
         [info object isa object $removed] [info object isa object $added] \
-        [expr {[$added configure -source] eq $ds}] [$added configure -rawplot]
-} -cleanup {::reloadtest::cleanup} -result {1 y2 0 1 1 {}}
+        [expr {[$added configure -source] eq $ds}] [$added configure -rawplot] [$old configure -type]
+} -cleanup {::reloadtest::cleanup} -result {1 y2 0 1 1 {} current}
 
-test reload-metadata-1.15 {plot merge transfers added trace to surviving plot and source} -body {
+test reload-metadata-1.15 {plot record merge assigns added trace to surviving plot and source} -body {
     set ds [::reloadtest::new DataSource calc calculation]
-    set staged [::reloadtest::new DataSource stage calculation]
     set p [::reloadtest::new RawPlot p 0 $ds]
-    set q [::reloadtest::new RawPlot p 0 $staged]
-    set tr [::reloadtest::new Trace x voltage $staged]
-    $q addTrace $tr
-    namespace eval [info object namespace $q] {my SealFileData}
-    namespace eval [info object namespace $ds] [list my MergeTraces $p $q]
-    namespace eval [info object namespace $q] {my DisposeOwned}
-    list [expr {[$p getTrace x] eq $tr}] [expr {[$tr configure -rawplot] eq $p}] \
+    namespace eval [info object namespace $ds] [list my MergeTraces $p {x {type voltage}}]
+    set tr [$p getTrace x]
+    list [expr {[$tr configure -rawplot] eq $p}] \
         [expr {[$tr configure -source] eq $ds}] [catch {$tr configure -name y}]
-} -cleanup {::reloadtest::cleanup} -result {1 1 1 1}
+} -cleanup {::reloadtest::cleanup} -result {1 1 1}
+
+test reload-metadata-1.16 {metadata stage creates no model objects and cleanup removes its namespace} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set ns [info object namespace $ds]
+    set before [list [lsort [info class instances ::spicetracesurfer::DataSource]] \
+        [lsort [info class instances ::spicetracesurfer::RawPlot]] [lsort [info class instances ::spicetracesurfer::Trace]]]
+    set stage [namespace eval $ns {my NewStage}]
+    dict set stage plots plot0 {index 0 traces {x {type voltage}}}
+    set after [list [lsort [info class instances ::spicetracesurfer::DataSource]] \
+        [lsort [info class instances ::spicetracesurfer::RawPlot]] [lsort [info class instances ::spicetracesurfer::Trace]]]
+    namespace eval $ns [list my DisposeStage $stage]
+    list [expr {$before eq $after}] [namespace exists [dict get $stage namespace]]
+} -cleanup {::reloadtest::cleanup} -result {1 0}
+
+test reload-metadata-1.17 {commit consumes plot records and preserves matching object identity} -body {
+    set ds [::reloadtest::new DataSource calc calculation]
+    set ns [info object namespace $ds]
+    namespace eval $ns {
+        set testStage [my NewStage]
+        dict set testStage plots plot0 {index 0 traces {x {type voltage}}}
+        try {my CommitStage testStage} finally {my DisposeStage $testStage}
+    }
+    set p [$ds getRawPlot plot0]
+    set tr [$p getTrace x]
+    namespace eval $ns {
+        set testStage [my NewStage]
+        dict set testStage plots plot0 {index 2 traces {x {type current} y {type voltage}}}
+        try {my CommitStage testStage} finally {my DisposeStage $testStage}
+    }
+    list [expr {[$ds getRawPlot plot0] eq $p}] [expr {[$p getTrace x] eq $tr}] \
+        [$p configure -index] [$tr configure -type] [catch {$p configure -index 9}] \
+        [catch {[$p getTrace y] configure -name z}] [namespace children $ns ${ns}::stage*]
+} -cleanup {::reloadtest::cleanup} -result {1 1 2 current 1 1 {}}
+
+test reload-metadata-1.18 {CSV header validation failure disposes stage before creating model objects} -body {
+    package require tclcsv
+    set ds [::reloadtest::new DataSource calc calculation]
+    set path [makeFile "x,x\n1,2" reload-duplicate.csv]
+    lappend ::reloadtest::files $path
+    $ds configure -type file -filetype csv -filepath $path
+    set ns [info object namespace $ds]
+    set before [list [info class instances ::spicetracesurfer::DataSource] \
+        [info class instances ::spicetracesurfer::RawPlot] [info class instances ::spicetracesurfer::Trace]]
+    set code [catch {namespace eval $ns {my StageFile}} message]
+    set after [list [info class instances ::spicetracesurfer::DataSource] \
+        [info class instances ::spicetracesurfer::RawPlot] [info class instances ::spicetracesurfer::Trace]]
+    list $code $message [expr {$before eq $after}] [namespace children $ns ${ns}::stage*]
+} -cleanup {::reloadtest::cleanup} -result {1 {Duplicate CSV column name 'x'} 1 {}}
 
 test reload-file-2.1 {CSV vectors are readonly but usable as expression inputs} -body {
     lassign [::reloadtest::csv "x\n1\n2"] ds path
@@ -313,25 +351,57 @@ test reload-file-2.9 {RAW reload updates loaded vector in place and leaves other
         [info exists [info object namespace $timeTrace]::vector]
 } -cleanup {::reloadtest::cleanup} -result {1 1 1 9.0 1 0}
 
-test reload-file-2.10 {numeric-type change preserves Trace but transfers replacement vector ownership} -body {
+test reload-file-2.10 {numeric-type change preserves Trace and adopts vector out of stage namespace} -body {
     set ds [::reloadtest::new DataSource calc calculation]
-    set staged [::reloadtest::new DataSource stage calculation]
+    set ns [info object namespace $ds]
     set tr [::reloadtest::new Trace x voltage $ds]
-    set replacement [::reloadtest::new Trace x voltage $staged]
     set v [rbc::vector create [info object namespace $tr]::samples -variable {}]
-    set incoming [rbc::vector create [info object namespace $replacement]::samples -type complex -variable {}]
     $tr configure -vector $v
-    $replacement configure -vector $incoming
     $ds addTrace $tr
-    $staged addTrace $replacement
-    namespace eval [info object namespace $ds] {my SealFileData}
-    namespace eval [info object namespace $staged] {my SealFileData}
-    namespace eval [info object namespace $ds] [list my MergeTraces $ds $staged]
-    $staged destroy
+    namespace eval $ns {my SealFileData}
+    set stage [namespace eval $ns {my NewStage}]
+    try {
+        set incoming [rbc::vector create [dict get $stage namespace]::v1 -type complex -variable {}]
+        $incoming readonly true
+        set records [dict create x [dict create type voltage vector $incoming]]
+        namespace eval $ns [list my MergeTraces $ds $records]
+    } finally {
+        namespace eval $ns [list my DisposeStage $stage]
+    }
     set new [$tr getVector]
     list [expr {[$ds getTrace x] eq $tr}] [expr {$new ne $v}] \
         [expr {$v ni [rbc::vector names]}] [$new type] [$new readonly]
 } -cleanup {::reloadtest::cleanup} -result {1 1 1 complex 1}
+
+test reload-file-2.11 {CSV staging creates no temporary model objects and cleans up its vectors} -body {
+    lassign [::reloadtest::csv "x\n1"] ds path
+    set ns [info object namespace $ds]
+    set before [list [lsort [info class instances ::spicetracesurfer::DataSource]] \
+        [lsort [info class instances ::spicetracesurfer::RawPlot]] [lsort [info class instances ::spicetracesurfer::Trace]]]
+    set vectors [lsort [rbc::vector names]]
+    set stage [namespace eval $ns {my StageFile}]
+    try {
+        set after [list [lsort [info class instances ::spicetracesurfer::DataSource]] \
+            [lsort [info class instances ::spicetracesurfer::RawPlot]] [lsort [info class instances ::spicetracesurfer::Trace]]]
+        set record [dict get $stage traces x]
+        set samples [[dict get $record vector] range 0 end]
+    } finally {
+        namespace eval $ns [list my DisposeStage $stage]
+    }
+    list [expr {$before eq $after}] $samples [expr {$vectors eq [lsort [rbc::vector names]]}] \
+        [namespace exists [dict get $stage namespace]]
+} -cleanup {::reloadtest::cleanup} -result {1 1.0 1 0}
+
+test reload-file-2.12 {failed staging removes temporary namespace without changing model objects} -body {
+    lassign [::reloadtest::csv "x\n1"] ds path
+    set ns [info object namespace $ds]
+    set tr [$ds getTrace x]
+    set before [lsort [rbc::vector names]]
+    ::reloadtest::write $path "x\n2\ninvalid"
+    set code [catch {$ds reload}]
+    list $code [expr {[$ds getTrace x] eq $tr}] \
+        [expr {$before eq [lsort [rbc::vector names]]}] [namespace children $ns ${ns}::stage*]
+} -cleanup {::reloadtest::cleanup} -result {1 1 1 {}}
 
 ::reloadtest::cleanup
 namespace delete ::reloadtest
