@@ -54,6 +54,12 @@ oo::configurable create ::spicetracesurfer::DataSource {
                 A trace cannot be registered with two owners. Calculation metadata remains editable, but changing
                 a registered name does not rekey its dictionary.
 
+                Ownership is established through addTrace or Trace.attachTo, which update both sides together.
+                Trace.getOwner reports membership; rawplot is a read-only view of that owner. Public sealFileData
+                only adds protection. Owner protocol methods (addTraceOwned, removeTraceOwned, registerOwner,
+                updateFrom, updateIndex and disposeOwned) check the TclOO caller before bypassing file locks.
+                These checks prevent accidental API misuse; Tcl introspection remains outside the protection model.
+
                 ## File protection and reload
                 Loaded RAW/CSV sources lock type, filepath, filetype, dialect and all CSV settings. Their plot
                 names/indices/source links, trace metadata/vector references and collection membership are sealed.
@@ -169,14 +175,14 @@ oo::configurable create ::spicetracesurfer::DataSource {
     }
     property csvbatchsize -set {
         my CheckMetadataWritable
-        if {![string is integer -strict $value] || $value <= 0} {
+        if {![string is integer -strict $value] || ($value <= 0)} {
             return -code error {CSV batch size must be a positive integer}
         }
         set csvbatchsize $value
     }
     property csvdelimiter -set {
         my CheckMetadataWritable
-        if {[string length $value] != 1 || ![string is ascii -strict $value]} {
+        if {([string length $value]!=1) || ![string is ascii -strict $value]} {
             return -code error {CSV delimiter must be a single ASCII character}
         }
         set csvdelimiter $value
@@ -215,13 +221,13 @@ oo::configurable create ::spicetracesurfer::DataSource {
     }
     variable name type filepath filetype dialect FileHandle RawPlots Traces
     variable csvbatchsize csvdelimiter csvencoding csvheader csvnametemplate
+    variable FileLocked RawFileStamp RawPath StageSerial
     initialize {
         variable SourceTypes
         const SourceTypes {file calculation network spreadsheet}
         variable FileTypes
         const FileTypes {raw csv touchstone}
     }
-    variable FileLocked RawFileStamp RawPath StageSerial
     constructor {args} {
         # Constructs a source and acquires its initial data or metadata.
         # name - Nonempty source display name.
@@ -269,14 +275,13 @@ oo::configurable create ::spicetracesurfer::DataSource {
         }
         try {
             if {$type eq {file} && $filetype in {raw csv}} {
-                package require rbc::vector 0.8.1
                 if {$filetype eq {raw}} {
                     my configure -dialect [dict get $arguments dialect]
                 }
                 set stage [my StageFile]
                 try {
                     my CommitStage stage
-                    my SealFileData
+                    my sealFileData
                 } finally {
                     my DisposeStage $stage
                 }
@@ -310,7 +315,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
             if {[info exists $collection]} {
                 dict for {key object} [set $collection] {
                     if {[info object isa object $object]} {
-                        catch {namespace eval [info object namespace $object] {my DisposeOwned}}
+                        catch {$object disposeOwned}
                     }
                 }
                 set $collection {}
@@ -322,15 +327,15 @@ oo::configurable create ::spicetracesurfer::DataSource {
         }
         unset -nocomplain RawFileStamp RawPath
     }
-    method SealFileData {} {
+    method sealFileData {} {
         # Locks registered metadata and any already loaded file vectors.
         #
         # Returns: Nothing.
         dict for {key object} $Traces {
-            namespace eval [info object namespace $object] {my SealFileData}
+            $object sealFileData
         }
         dict for {key object} $RawPlots {
-            namespace eval [info object namespace $object] {my SealFileData}
+            $object sealFileData
         }
         set FileLocked 1
     }
@@ -421,15 +426,15 @@ oo::configurable create ::spicetracesurfer::DataSource {
             } else {
                 set current [::spicetracesurfer::RawPlot new $key [dict get $replacement index] [self]]
                 dict set RawPlots $key $current
-                namespace eval [info object namespace $current] {my SealFileData}
+                $current sealFileData
             }
             my MergeTraces $current [dict get $replacement traces]
-            set [info object namespace $current]::index [dict get $replacement index]
-            namespace eval [info object namespace $current] {my SealFileData}
+            $current updateIndex [dict get $replacement index]
+            $current sealFileData
         }
         dict for {key current} $RawPlots {
             if {![dict exists $incomingPlots $key]} {
-                namespace eval [info object namespace $current] {my DisposeOwned}
+                $current disposeOwned
                 dict unset RawPlots $key
             }
         }
@@ -456,31 +461,26 @@ oo::configurable create ::spicetracesurfer::DataSource {
         # Internal method. Matching traces are updated; only new names create Trace objects. A newly
         # created trace is cleaned up if its initialization fails. Removed names are disposed by the owner.
         # Returns: Nothing. Commit errors propagate and do not roll back earlier updates.
-        set ownerNs [info object namespace $owner]
+        set existing [$owner getTraces]
         dict for {key replacement} $incoming {
-            if {[dict exists [set ${ownerNs}::Traces] $key]} {
-                set current [dict get [set ${ownerNs}::Traces] $key]
-                namespace eval [info object namespace $current] [list my UpdateFrom $replacement]
+            if {[dict exists $existing $key]} {
+                set current [dict get $existing $key]
+                $current updateFrom $replacement
             } else {
                 set current [::spicetracesurfer::Trace new -- $key [dict get $replacement type] [self]]
                 try {
-                    set traceNs [info object namespace $current]
-                    set ${traceNs}::rawplot [expr {$owner eq [self] ? {} : $owner}]
-                    set ${traceNs}::RegistrationOwner $owner
-                    namespace eval $traceNs [list my UpdateFrom $replacement]
-                    namespace eval $traceNs {my SealFileData}
-                    dict set ${ownerNs}::Traces $key $current
+                    $current updateFrom $replacement
+                    $owner addTraceOwned $current
+                    $current sealFileData
                 } on error {message options} {
-                    namespace eval [info object namespace $current] {my DisposeOwned}
+                    # Before registration, the source owns cleanup of the new descriptor.
+                    if {[$current getOwner] eq {}} {$current disposeOwned}
                     return -options $options $message
                 }
             }
         }
-        dict for {key current} [set ${ownerNs}::Traces] {
-            if {![dict exists $incoming $key]} {
-                namespace eval [info object namespace $current] {my DisposeOwned}
-                dict unset ${ownerNs}::Traces $key
-            }
+        dict for {key current} $existing {
+            if {![dict exists $incoming $key]} {$owner removeTraceOwned $key}
         }
     }
     method StageRaw {stageVar} {
@@ -513,8 +513,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
                 if {[dict exists $RawPlots $key]} {
                     set oldTraces [[dict get $RawPlots $key] getTraces]
                     if {[dict exists $oldTraces $traceName]} {
-                        set traceNs [info object namespace [dict get $oldTraces $traceName]]
-                        if {[info exists ${traceNs}::vector] && ([set ${traceNs}::vector] ne {})} {
+                        if {[[dict get $oldTraces $traceName] getLoadedVector] ne {}} {
                             set vector [$reader vector -plot $index $traceName\
                                                 -name [dict get $stage namespace]::v[incr vectorIndex]]
                             $vector readonly true
@@ -692,10 +691,10 @@ oo::configurable create ::spicetracesurfer::DataSource {
                 }
                 return $result
             } else {
-                return -code error "Raw vector cannot be readed because file type of data source is not raw"
+                return -code error {Raw vector cannot be readed because file type of data source is not raw}
             }
         } else {
-            return -code error "Raw vector cannot be readed because data source is not a file type"
+            return -code error {Raw vector cannot be readed because data source is not a file type}
         }
     }
     method getRawPlot {name} {
@@ -714,12 +713,46 @@ oo::configurable create ::spicetracesurfer::DataSource {
         return $RawPlots
     }
     method addTrace {trace} {
-        # Registers a trace directly under this source and clears its rawplot property.
-        # trace - Trace object to register, indexed by its current name.
+        # Registers a trace using its local name and assigns both sides of ownership.
+        # trace - Unattached Trace from the same DataSource, or an already registered identical object.
         #
-        # Rejects a different trace with the same name without changing either object. Re-registering
-        # the identical object is a no-op. New membership requires editable metadata and matching source.
-        # Failed registration leaves the incoming object caller-owned; existing traces are never destroyed.
+        # Duplicate names and conflicting owners are rejected without mutation. Sealed collections reject
+        # additions; registering the identical object again is a no-op.
+        # Returns: No public result.
+        my RegisterTrace $trace false
+    }
+    method addTraceOwned {trace} {
+        # Registers a newly committed trace in a potentially sealed collection.
+        # trace - New Trace belonging to this collection's DataSource.
+        #
+        # Owner protocol: callable only from a method of the owning DataSource, not from a script.
+        # The caller is checked from TclOO call context; an owner name supplied as an argument is insufficient.
+        # Returns: No public result.
+        if {[catch {self caller} caller] || [lindex $caller 1] ne [self]} {
+            return -code error {Only the owning DataSource may commit collection changes}
+        }
+        my RegisterTrace $trace true
+    }
+    method removeTraceOwned {name} {
+        # Removes and destroys a trace during source commit.
+        # name - Registered local trace name.
+        #
+        # Owner protocol: callable only from a method of the owning DataSource.
+        # Returns: Nothing.
+        if {[catch {self caller} caller] || [lindex $caller 1] ne [self]} {
+            return -code error {Only the owning DataSource may commit collection changes}
+        }
+        set trace [dict get $Traces $name]
+        $trace disposeOwned
+        dict unset Traces $name
+    }
+    method RegisterTrace {trace internal} {
+        # Validates collection membership and asks the trace to accept this owner.
+        # trace - Trace object to register.
+        # internal - True only for the checked owner commit path, which bypasses collection locking.
+        #
+        # Internal method shared by public registration and source commit. No user callbacks or event-loop
+        # processing occur between accepting ownership and inserting the dictionary entry.
         # Returns: No public result.
         if {![info object isa typeof $trace ::spicetracesurfer::Trace]} {
             return -code error {Expected a live Trace object}
@@ -731,20 +764,13 @@ oo::configurable create ::spicetracesurfer::DataSource {
             }
             return -code error "Trace '$key' already exists"
         }
-        my CheckMetadataWritable
+        if {!$internal} {
+            my CheckMetadataWritable
+        }
         if {[$trace configure -source] ne [self]} {
             return -code error {Trace belongs to a different data source}
         }
-        set traceNs [info object namespace $trace]
-        if {[info exists ${traceNs}::RegistrationOwner] && ([set ${traceNs}::RegistrationOwner] ne [self])} {
-            return -code error {Trace is already registered with another owner}
-        }
-        if {[info exists ${traceNs}::rawplot] && ([set ${traceNs}::rawplot] ne {}) &&\
-                    ([set ${traceNs}::rawplot] ne {})} {
-            return -code error {Trace already belongs to a different raw plot}
-        }
-        $trace configure -rawplot {}
-        set ${traceNs}::RegistrationOwner [self]
+        $trace registerOwner [self]
         dict set Traces $key $trace
     }
     method getTrace {name} {
@@ -834,10 +860,14 @@ oo::configurable create ::spicetracesurfer::RawPlot {
         my CheckMetadataWritable
         next
     }
-    method DisposeOwned {} {
-        # Allows the owner to release this object during source destruction or reload.
+    method disposeOwned {} {
+        # Allows the owning source or collection to release this object despite file protection.
         #
+        # Owner protocol: validates the actual TclOO caller before bypassing the public destroy lock.
         # Returns: Nothing.
+        if {[catch {self caller} caller] || [lindex $caller 1] ne $source} {
+            return -code error {Only the owning object may dispose this object}
+        }
         set FileLocked 0
         my destroy
     }
@@ -866,53 +896,89 @@ oo::configurable create ::spicetracesurfer::RawPlot {
         if {[info exists Traces]} {
             if {$Traces ne {}} {
                 dict for {name trace} $Traces {
-                    namespace eval [info object namespace $trace] {my DisposeOwned}
+                    $trace disposeOwned
                 }
             }
         }
     }
     method addTrace {trace} {
-        # Registers a trace and assigns this plot as its rawplot.
-        # trace - Trace object indexed by its current name.
+        # Registers a trace using its local name and assigns both sides of ownership.
+        # trace - Unattached Trace from the same DataSource, or an already registered identical object.
         #
-        # Duplicate names belonging to another object are errors; registering the same object is a no-op.
-        # Rejects changes to a sealed file plot and mismatched or already registered owners before mutation.
-        # On failure the incoming trace remains caller-owned and unchanged.
+        # Duplicate names and conflicting owners are rejected without mutation. Sealed collections reject
+        # additions; registering the identical object again is a no-op.
+        # Returns: No public result.
+        my RegisterTrace $trace false
+    }
+    method addTraceOwned {trace} {
+        # Registers a newly committed trace in a potentially sealed collection.
+        # trace - New Trace belonging to this collection's DataSource.
+        #
+        # Owner protocol: callable only from a method of the owning DataSource, not from a script.
+        # The caller is checked from TclOO call context; an owner name supplied as an argument is insufficient.
+        # Returns: No public result.
+        if {[catch {self caller} caller] || ([lindex $caller 1] ne $source)} {
+            return -code error {Only the owning DataSource may commit collection changes}
+        }
+        my RegisterTrace $trace true
+    }
+    method removeTraceOwned {name} {
+        # Removes and destroys a trace during source commit.
+        # name - Registered local trace name.
+        #
+        # Owner protocol: callable only from a method of the owning DataSource.
+        # Returns: Nothing.
+        if {[catch {self caller} caller] || ([lindex $caller 1] ne $source)} {
+            return -code error {Only the owning DataSource may commit collection changes}
+        }
+        set trace [dict get $Traces $name]
+        $trace disposeOwned
+        dict unset Traces $name
+    }
+    method RegisterTrace {trace internal} {
+        # Validates collection membership and asks the trace to accept this owner.
+        # trace - Trace object to register.
+        # internal - True only for the checked owner commit path, which bypasses collection locking.
+        #
+        # Internal method shared by public registration and source commit. No user callbacks or event-loop
+        # processing occur between accepting ownership and inserting the dictionary entry.
         # Returns: No public result.
         if {![info object isa typeof $trace ::spicetracesurfer::Trace]} {
             return -code error {Expected a live Trace object}
         }
         set key [$trace configure -name]
         if {[dict exists $Traces $key]} {
-            if {[dict get $Traces $key] eq $trace} {
-                return
-            }
+            if {[dict get $Traces $key] eq $trace} {return}
             return -code error "Trace '$key' already exists"
         }
-        my CheckMetadataWritable
+        if {!$internal} {
+            my CheckMetadataWritable
+        }
         if {[$trace configure -source] ne $source} {
             return -code error {Trace belongs to a different data source}
         }
-        set traceNs [info object namespace $trace]
-        if {[info exists ${traceNs}::RegistrationOwner] && ([set ${traceNs}::RegistrationOwner] ne [self])} {
-            return -code error {Trace is already registered with another owner}
-        }
-        if {[info exists ${traceNs}::rawplot] && ([set ${traceNs}::rawplot] ne {}) &&\
-                    ([set ${traceNs}::rawplot] ne [self])} {
-            return -code error {Trace already belongs to a different raw plot}
-        }
-        $trace configure -rawplot [self]
-        set ${traceNs}::RegistrationOwner [self]
+        $trace registerOwner [self]
         dict set Traces $key $trace
     }
-    method SealFileData {} {
+    method sealFileData {} {
         # Seals file metadata and all registered traces.
         #
         # Returns: Nothing.
         dict for {key trace} $Traces {
-            namespace eval [info object namespace $trace] {my SealFileData}
+            $trace sealFileData
         }
         set FileLocked 1
+    }
+    method updateIndex {value} {
+        # Updates the RAW reader index during source reload.
+        # value - Replacement plot index from staged metadata.
+        #
+        # Owner protocol: callable only from a method of this plot's source.
+        # Returns: Nothing.
+        if {[catch {self caller} caller] || ([lindex $caller 1] ne $source)} {
+            return -code error {Only the owning DataSource may update a plot index}
+        }
+        set index $value
     }
     method getTrace {name} {
         # Looks up a trace within this plot.
@@ -980,8 +1046,8 @@ oo::configurable create ::spicetracesurfer::Trace {
                     Owning DataSource object, validated by the setter.
                 }
                 -rawplot {
-                    RawPlot object for RAW traces, or empty for directly source-owned traces; set by the owner's
-                    addTrace method.
+                    Read-only RawPlot owner, or empty for directly source-owned and unattached traces.
+                    Derived from getOwner; use attachTo or the owner's addTrace to register a trace.
                 }
                 -axis {
                     Application-defined axis association. No default, validation or automatic axis inference.
@@ -994,7 +1060,8 @@ oo::configurable create ::spicetracesurfer::Trace {
         set name $value
     }
     property fullname -kind readable -get {
-        if {[info exists rawplot] && $rawplot ne {}} {
+        set rawplot [my configure -rawplot]
+        if {$rawplot ne {}} {
             return "[$rawplot configure -fullname].$name"
         }
         return "[$source configure -name].$name"
@@ -1037,19 +1104,24 @@ oo::configurable create ::spicetracesurfer::Trace {
     }
     property source -set {
         my CheckMetadataWritable
+        if {($Owner ne {}) && ($value ne $source)} {
+            return -code error {Cannot change the source of a registered trace}
+        }
         if {![info object class $value ::spicetracesurfer::DataSource]} {
-            return -code error "Source must be an object of class ::spicetracesurfer::DataSource"
+            return -code error {Source must be an object of class ::spicetracesurfer::DataSource}
         } else {
             set source $value
         }
     }
-    property rawplot -set {
-        my CheckMetadataWritable
-        set rawplot $value
+    property rawplot -kind readable -get {
+        if {($Owner ne {}) && ($Owner ne $source)} {
+            return $Owner
+        }
+        return
     }
     property axis
-    variable name fullname type numtype length vector source rawplot axis
-    variable FileLocked RegistrationOwner
+    variable name fullname type numtype length vector source axis
+    variable FileLocked Owner
     method CheckMetadataWritable {} {
         # Rejects public metadata or membership changes after file data is sealed.
         #
@@ -1065,10 +1137,14 @@ oo::configurable create ::spicetracesurfer::Trace {
         my CheckMetadataWritable
         next
     }
-    method DisposeOwned {} {
-        # Allows the owner to release this object during source destruction or reload.
+    method disposeOwned {} {
+        # Allows the owning source or collection to release this object despite file protection.
         #
+        # Owner protocol: validates the actual TclOO caller before bypassing the public destroy lock.
         # Returns: Nothing.
+        if {[catch {self caller} caller] || (([lindex $caller 1] ne $source) && ([lindex $caller 1] ne $Owner))} {
+            return -code error {Only the owning object may dispose this object}
+        }
         set FileLocked 0
         my destroy
     }
@@ -1083,6 +1159,7 @@ oo::configurable create ::spicetracesurfer::Trace {
         # operation performed by that owner's addTrace method.
         # Synopsis: name type source ?-vector vectorName?
         # Returns: The new Trace object command.
+        set Owner {}
         set arguments [argparse -inline  {
             name
             type
@@ -1103,7 +1180,7 @@ oo::configurable create ::spicetracesurfer::Trace {
             }
         }
     }
-    method SealFileData {} {
+    method sealFileData {} {
         # Protects metadata and already loaded vector data using RBC readonly.
         #
         # Returns: Nothing.
@@ -1112,14 +1189,72 @@ oo::configurable create ::spicetracesurfer::Trace {
         }
         set FileLocked 1
     }
-    method UpdateFrom {replacement} {
+    method getOwner {} {
+        # Returns the registered collection owner without exposing object variables.
+        #
+        # Returns: A DataSource or RawPlot command, or an empty string when unattached.
+        return $Owner
+    }
+    method attachTo {owner} {
+        # Registers this trace through an owner's public collection interface.
+        # owner - DataSource or RawPlot that should own this trace.
+        #
+        # Delegates to addTrace so ownership and collection membership change together. Duplicate names,
+        # conflicting owners and locked collections are rejected; existing identical membership is a no-op.
+        # Returns: This Trace object.
+        if {![info object isa typeof $owner ::spicetracesurfer::DataSource] &&\
+                    ![info object isa typeof $owner ::spicetracesurfer::RawPlot]} {
+            return -code error {Owner must be a DataSource or RawPlot}
+        }
+        $owner addTrace [self]
+        return [self]
+    }
+    method registerOwner {owner} {
+        # Accepts ownership as part of the owner's registration operation.
+        # owner - DataSource or RawPlot registering this trace.
+        #
+        # Owner protocol: only that owner's RegisterTrace method may call this operation. Public callers
+        # should use attachTo or owner addTrace, which also maintain the collection dictionary.
+        # Returns: Nothing. An already assigned different owner is rejected without mutation.
+        if {[catch {self caller} caller] || ([lindex $caller 1] ne $owner) || ([lindex $caller 2] ne {RegisterTrace})} {
+            return -code error {Ownership must be assigned through addTrace or attachTo}
+        }
+        if {($Owner ne {}) && ($Owner ne $owner)} {
+            return -code error {Trace is already registered with another owner}
+        }
+        if {[info object isa typeof $owner ::spicetracesurfer::DataSource]} {
+            set ownerSource $owner
+        } elseif {[info object isa typeof $owner ::spicetracesurfer::RawPlot]} {
+            set ownerSource [$owner configure -source]
+        } else {
+            return -code error {Owner must be a DataSource or RawPlot}
+        }
+        if {$ownerSource ne $source} {
+            return -code error {Trace belongs to a different data source}
+        }
+        set Owner $owner
+    }
+    method getLoadedVector {} {
+        # Inspects assigned vector storage without triggering lazy loading.
+        #
+        # Returns: The current vector command, or an empty string when none is assigned.
+        if {[info exists vector]} {
+            return $vector
+        }
+        return {}
+    }
+    method updateFrom {replacement} {
         # Updates this trace from a staged metadata record without public metadata setters.
         # replacement - Dictionary containing type and an optional fully populated readonly vector.
         #
-        # Internal owner operation. Preserves this object and its axis association. Same-type vectors are
+        # Owner protocol: only a method of this trace's DataSource may invoke it.
+        # Preserves this object and its axis association. Same-type vectors are
         # copied in place; different types transfer the staged vector into this object's namespace and
         # destroy the old vector. An unloaded replacement keeps an unloaded destination lazy.
         # Returns: Nothing. Copy failures restore readonly protection but do not undo prior source updates.
+        if {[catch {self caller} caller] || ([lindex $caller 1] ne $source)} {
+            return -code error {Only the owning DataSource may update trace data}
+        }
         if {[dict exists $replacement vector]} {
             set incoming [dict get $replacement vector]
             if {[info exists vector] && ($vector ne {}) && ([$vector type] eq [$incoming type])} {
@@ -1158,7 +1293,8 @@ oo::configurable create ::spicetracesurfer::Trace {
         if {[info exists vector]} {
             return [my configure -vector]
         } else {
-            set loaded [$source readRawVector [$rawplot configure -index] $name [info object namespace [self]]]
+            set loaded [$source readRawVector [[my configure -rawplot] configure -index] $name\
+                                [info object namespace [self]]]
             try {
                 if {[info exists FileLocked] && $FileLocked} {
                     $loaded readonly true
@@ -1471,12 +1607,13 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         while {[llength $classes]} {
             set class [lindex $classes 0]
             set classes [lrange $classes 1 end]
-            if {$class in $visited} {continue}
+            if {$class in $visited} {
+                continue
+            }
             lappend visited $class
             lappend classes {*}[info class subclasses $class]
             foreach object [info class instances $class] {
-                set ns [info object namespace $object]
-                if {[info exists ${ns}::vector] && ([set ${ns}::vector] eq $vector)} {
+                if {[$object getLoadedVector] eq $vector} {
                     return $object
                 }
             }

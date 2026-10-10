@@ -431,23 +431,22 @@ test spicetracesurfer-csv-5.18 {header names beginning with a dash are positiona
 
 test spicetracesurfer-csv-properties-6.1 {CSV defaults are readable object properties} -body {
     set ds [::stsTest::new DataSource source1 calculation]
-    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] \
-        [$ds configure -csvencoding] [$ds configure -csvheader] [$ds configure -csvnametemplate]
+    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] [$ds configure -csvencoding]\
+            [$ds configure -csvheader] [$ds configure -csvnametemplate]
 } -cleanup {::stsTest::cleanup} -result {8192 , utf-8 true column%d}
 
 test spicetracesurfer-csv-properties-6.2 {constructor assigns all CSV properties} -body {
-    set ds [::stsTest::new DataSource source1 calculation -csvbatchsize 32 \
-        -csvdelimiter {;} -csvencoding iso8859-1 -csvheader false -csvnametemplate {v%03d}]
-    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] \
-        [$ds configure -csvencoding] [$ds configure -csvheader] [$ds configure -csvnametemplate]
+    set ds [::stsTest::new DataSource source1 calculation -csvbatchsize 32 -csvdelimiter {;} -csvencoding iso8859-1\
+                    -csvheader false -csvnametemplate {v%03d}]
+    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] [$ds configure -csvencoding]\
+            [$ds configure -csvheader] [$ds configure -csvnametemplate]
 } -cleanup {::stsTest::cleanup} -result {32 {;} iso8859-1 false v%03d}
 
 test spicetracesurfer-csv-properties-6.3 {CSV properties can be configured after construction} -body {
     set ds [::stsTest::new DataSource source1 calculation]
-    $ds configure -csvbatchsize 16 -csvdelimiter {;} -csvencoding ascii \
-        -csvheader false -csvnametemplate {signal_%d}
-    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] \
-        [$ds configure -csvencoding] [$ds configure -csvheader] [$ds configure -csvnametemplate]
+    $ds configure -csvbatchsize 16 -csvdelimiter {;} -csvencoding ascii -csvheader false -csvnametemplate {signal_%d}
+    list [$ds configure -csvbatchsize] [$ds configure -csvdelimiter] [$ds configure -csvencoding]\
+            [$ds configure -csvheader] [$ds configure -csvnametemplate]
 } -cleanup {::stsTest::cleanup} -result {16 {;} ascii false signal_%d}
 
 ### spicetracesurfer-csv-properties

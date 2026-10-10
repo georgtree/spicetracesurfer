@@ -9,6 +9,7 @@
 
 package require Tcl 9.0-
 package require argparse
+package require rbc::vector 0.8.1
 package require rbc::graphtoolbar
 package require tclsimrawreader
 package require tclcsv
