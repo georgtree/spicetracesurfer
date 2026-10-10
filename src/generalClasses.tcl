@@ -1345,6 +1345,30 @@ oo::configurable create ::spicetracesurfer::Evaluator {
                 Separate evaluator objects have separate script namespaces. This is organisation for trusted scripts,
                 not a security sandbox: fully qualified Tcl commands can access other application state.
 
+                ## Preloaded commands
+                The spicetracesurfer package loads tclmeasure. By default each evaluator imports its exported
+                ::tclmeasure::measure command as measure in the script namespace. Imports persist across evaluate
+                calls and are local to that evaluator; loaded packages and their package-level state remain shared.
+                Destroying the evaluator removes imports without deleting the original extension commands.
+
+                The constructor's -imports option replaces the default with a list of explicit fully qualified
+                exported command names. Use -imports {} for no imports. Packages must already be loaded; the
+                evaluator does not infer package names or load packages from command names. Wildcards, missing or
+                unexported commands, duplicate short names and collisions with trace, derive or publish are errors.
+                Imports never use -force. The read-only -imports property reports the configured list.
+
+                With a vector-enabled build of tclmeasure, a script can measure real trace vectors directly:
+
+                ```tcl
+                $evaluator evaluate {
+                    measure -xname [trace simulation plot0 time] \
+                        -avg [list -vec [trace simulation plot0 {v(out)}]]
+                }
+                ```
+
+                This reads the vectors without converting samples to lists or changing their protection. Direct
+                vector input requires tclmeasure built with --with-rbc; complex input is not supported by measure.
+
                 ## Results and ownership
                 The calculation source owns published traces and vectors. The evaluator borrows sources and never
                 destroys them. Destroying the evaluator removes its script namespace, aliases and user procedures;
@@ -1366,6 +1390,10 @@ oo::configurable create ::spicetracesurfer::Evaluator {
                 are not rolled back. Supplying a vector already assigned to any existing Trace is rejected.
             }
             propertydescriptions {
+                -imports {
+                    Read-only list of explicitly imported exported commands. Defaults to ::tclmeasure::measure.
+                    Set only at construction; an empty list disables imports.
+                }
                 -resultsource {
                     Read-only supplied DataSource with type calculation. Owns result traces and vectors; borrowed by
                     the evaluator.
@@ -1383,25 +1411,32 @@ oo::configurable create ::spicetracesurfer::Evaluator {
     property resultalias -kind readable -get {
         return $ResultAlias
     }
-    variable Sources ResultSource ResultAlias ScriptNamespace Serial
+    property imports -kind readable -get {
+        return $Imports
+    }
+    variable Sources ResultSource ResultAlias ScriptNamespace Serial Imports
 
     constructor {args} {
         # Creates a persistent script environment borrowing a calculation source.
         # -resultsource - source: Required live DataSource of type calculation; borrowed by the evaluator.
         # -resultalias - alias: Nonempty source lookup alias for results; defaults to results.
+        # -imports - commands: Explicit fully qualified exported commands; defaults to ::tclmeasure::measure.
         #
         # Validates and automatically attaches the result source, then installs trace, derive and publish aliases in a
-        # child namespace of the evaluator object namespace.
-        # Synopsis: -resultsource source ?-resultalias alias?
+        # child namespace of the evaluator object namespace, followed by imports from already loaded packages.
+        # Import errors fail construction and remove the partial script namespace without destroying borrowed sources.
+        # Synopsis: -resultsource source ?-resultalias alias? ?-imports commands?
         # Returns: The new Evaluator object command.
         set arguments [argparse -inline {
             -resultsource=
             {-resultalias= -default results}
+            {-imports= -default ::tclmeasure::measure}
         }]
         set Sources {}
         set Serial 0
         set ResultSource [dict get $arguments resultsource]
         set ResultAlias [dict get $arguments resultalias]
+        set Imports [dict get $arguments imports]
         my CheckResultSource
         my attach $ResultSource -name $ResultAlias
         set ScriptNamespace [info object namespace [self]]::script
@@ -1409,10 +1444,37 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         foreach command {trace derive publish} {
             interp alias {} ${ScriptNamespace}::$command {} [self] $command
         }
+        my ImportCommands
     }
 
     # The object namespace (including script commands/variables) is removed by
     # TclOO. Borrowed sources and their result vectors deliberately survive.
+    method ImportCommands {} {
+        # Imports the configured exported commands into this evaluator's script namespace.
+        #
+        # Internal constructor helper. Requires literal fully qualified names and checks local name collisions
+        # before importing. Uses namespace import without -force, then verifies an import actually occurred:
+        # Tcl silently ignores existing commands that are not exported by their namespace.
+        # Returns: Nothing. Any invalid import raises an error and aborts evaluator construction.
+        set names [dict create trace 1 derive 1 publish 1]
+        foreach command $Imports {
+            if {![string match ::* $command] || [regexp {[*?\[\]]} $command]} {
+                return -code error "Import must be an explicit fully qualified command name: '$command'"
+            }
+            if {[namespace which -command $command] eq {}} {
+                return -code error "Import command '$command' does not exist; load its package first"
+            }
+            set tail [namespace tail $command]
+            if {[dict exists $names $tail]} {
+                return -code error "Import name '$tail' conflicts with an evaluator command or another import"
+            }
+            dict set names $tail 1
+            namespace eval $ScriptNamespace [list ::namespace import $command]
+            if {[namespace which -command ${ScriptNamespace}::$tail] eq {}} {
+                return -code error "Import command '$command' is not exported by its namespace"
+            }
+        }
+    }
     method CheckSource {source} {
         # Checks that a source is a live DataSource object or subclass instance.
         # source - Object command to validate.

@@ -1,0 +1,123 @@
+# Imports use real tclmeasure; fixture commands exercise only import validation.
+package require Tcl 9.0-
+package require tcltest 2
+namespace import ::tcltest::*
+set projectDir [file dirname [file dirname [file normalize [info script]]]]
+lappend auto_path $projectDir [file join $projectDir lib]
+package require spicetracesurfer
+package require tclmeasure
+
+namespace eval ::importtest {variable objects {}}
+proc ::importtest::new {class args} {
+    set object [::spicetracesurfer::$class new {*}$args]
+    lappend ::importtest::objects $object
+    return $object
+}
+proc ::importtest::setup {args} {
+    set ds [new DataSource results calculation]
+    return [list $ds [new Evaluator -resultsource $ds {*}$args]]
+}
+proc ::importtest::cleanup {} {
+    foreach object [lreverse $::importtest::objects] {
+        if {[info object isa object $object]} {
+            catch {$object destroy}
+        }
+    }
+    set ::importtest::objects {}
+}
+namespace eval ::importtest::commands {
+    namespace export trace measure helper
+    proc trace {} {}
+    proc measure {} {}
+    proc helper {} {
+        return helper-result
+    }
+    proc hidden {} {}
+}
+
+test evaluator-imports-1.1 {default imports only the exported measure command} -body {
+    lassign [::importtest::setup] ds e
+    list [$e configure -imports] [$e evaluate {namespace import}] [$e evaluate {namespace origin measure}]
+} -cleanup {::importtest::cleanup} -result {::tclmeasure::measure measure ::tclmeasure::measure}
+
+test evaluator-imports-1.2 {unqualified measure executes real extension with persistent script variables} -body {
+    lassign [::importtest::setup] ds e
+    $e evaluate {set data {x {0 1 2} y {0 2 4}}}
+    $e evaluate {measure -xname x -data $data -avg {-vec y}}
+} -cleanup {::importtest::cleanup} -result 2.0
+
+test evaluator-imports-1.3 {imports can be disabled independently for each evaluator} -body {
+    lassign [::importtest::setup] ds a
+    set b [::importtest::new Evaluator -resultsource $ds -imports {}]
+    list [$a evaluate {namespace import}] [$b evaluate {namespace import}] [$b configure -imports]
+} -cleanup {::importtest::cleanup} -result {measure {} {}}
+
+test evaluator-imports-1.4 {custom explicit list replaces the default and is readable only} -body {
+    lassign [::importtest::setup -imports {::importtest::commands::helper}] ds e
+    list [$e evaluate {helper}] [$e evaluate {namespace import}] [catch {$e configure -imports {}}]
+} -cleanup {::importtest::cleanup} -result {helper-result helper 1}
+
+test evaluator-imports-1.5 {destroying one evaluator preserves original and another evaluator import} -body {
+    lassign [::importtest::setup] ds a
+    set b [::importtest::new Evaluator -resultsource $ds]
+    $a destroy
+    list [namespace which -command ::tclmeasure::measure] [$b evaluate {namespace origin measure}]
+} -cleanup {::importtest::cleanup} -result {::tclmeasure::measure ::tclmeasure::measure}
+
+test evaluator-imports-1.6 {reserved evaluator command cannot be replaced} -body {
+    ::importtest::setup -imports {::importtest::commands::trace}
+} -cleanup {::importtest::cleanup} -returnCodes error\
+        -result {Import name 'trace' conflicts with an evaluator command or another import}
+
+test evaluator-imports-1.7 {colliding imported names fail even after the first import succeeds} -body {
+    ::importtest::setup -imports {::tclmeasure::measure ::importtest::commands::measure}
+} -cleanup {::importtest::cleanup} -returnCodes error\
+        -result {Import name 'measure' conflicts with an evaluator command or another import}
+
+test evaluator-imports-1.8 {nonexported command is rejected instead of silently ignored} -body {
+    ::importtest::setup -imports {::importtest::commands::hidden}
+} -cleanup {::importtest::cleanup} -returnCodes error\
+        -result {Import command '::importtest::commands::hidden' is not exported by its namespace}
+
+test evaluator-imports-1.9 {relative names and glob patterns are rejected} -body {
+    set ds [::importtest::new DataSource results calculation]
+    set codes {}
+    foreach command {tclmeasure::measure ::tclmeasure::* ::tclmeasure::measur? {::tclmeasure::measur[e]}} {
+        lappend codes [catch {::importtest::new Evaluator -resultsource $ds -imports [list $command]}]
+    }
+    set codes
+} -cleanup {::importtest::cleanup} -result {1 1 1 1}
+
+test evaluator-imports-1.10 {failed construction cleans partial imports and preserves borrowed source} -body {
+    set ds [::importtest::new DataSource results calculation]
+    set before [lsort [namespace children ::oo]]
+    set code [catch {::importtest::new Evaluator -resultsource $ds \
+        -imports {::tclmeasure::measure ::importtest::commands::missing}} message]
+    list $code $message [expr {$before eq [lsort [namespace children ::oo]]}] [info object isa object $ds]\
+            [namespace which -command ::tclmeasure::measure]
+} -cleanup {::importtest::cleanup} -result {1 {Import command '::importtest::commands::missing' does not exist;\
+                                                       load its package first} 1 1 ::tclmeasure::measure}
+
+testConstraint measureVectorInputs [expr {![catch {::tclmeasure::VectorSupport}]}]
+test evaluator-imports-2.1 {measure consumes trace vectors without copying or unlocking them} \
+    -constraints measureVectorInputs -body {
+    lassign [::importtest::setup] result e
+    set input [::importtest::new DataSource input calculation]
+    foreach {name values} {x {0 1 2} y {0 2 4}} {
+        set tr [::importtest::new Trace $name unknown $input]
+        set v [rbc::vector create [info object namespace $tr]::samples -variable {}]
+        $v set $values
+        $tr configure -vector $v
+        $input addTrace $tr
+    }
+    $input sealFileData
+    $e attach $input
+    set before [lsort [rbc::vector names]]
+    set average [$e evaluate {measure -xname [trace input x] -avg [list -vec [trace input y]]}]
+    list $average [expr {$before eq [lsort [rbc::vector names]]}] [[[$input getTrace x] getVector] readonly]\
+            [[[$input getTrace y] getVector] readonly]
+} -cleanup {::importtest::cleanup} -result {2.0 1 1 1}
+
+::importtest::cleanup
+namespace delete ::importtest
+cleanupTests

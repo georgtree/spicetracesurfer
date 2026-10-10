@@ -13,6 +13,7 @@ package require rbc::vector 0.8.1
 package require rbc::graphtoolbar
 package require tclsimrawreader
 package require tclcsv
+package require tclmeasure
 package require splitlayout
 
 package provide spicetracesurfer 0.1
