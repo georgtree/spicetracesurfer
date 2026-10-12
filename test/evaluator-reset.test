@@ -73,7 +73,7 @@ test evaluator-reset-1.3 {reset removes state and repairs aliases while retainin
     }]
     set same [expr {[$e reset] eq $e}]
     set state [$e evaluate {list [info exists local] [info commands [namespace current]::helper]\
-                                    [namespace import] [lindex [interp alias {} [namespace current]::trace] end]}]
+                                    [lindex [interp alias {} [namespace current]::measure] end] [lindex [interp alias {} [namespace current]::trace] end]}]
     list $same $state [namespace exists $old] [expr {$before eq [$e getSources]}]\
             [expr {[$ds getTrace retained] eq $tr}]
 } -cleanup {::resettest::cleanup} -result {1 {0 {} measure trace} 0 1 1}

@@ -1,0 +1,210 @@
+package require Tcl 9.0-
+package require tcltest 2
+namespace import ::tcltest::*
+set projectDir [file dirname [file dirname [file normalize [info script]]]]
+lappend auto_path $projectDir [file join $projectDir lib]
+package require spicetracesurfer
+namespace eval ::asynctest {
+    variable objects {}
+    variable done 0
+    variable outcome {}
+    variable pulse {}
+    variable ticks {}
+    variable progress 0
+}
+proc ::asynctest::new {class args} {
+    set o [::spicetracesurfer::$class new {*}$args]
+    lappend ::asynctest::objects $o
+    return $o
+}
+proc ::asynctest::setup {} {
+    set ds [new DataSource results calculation]
+    set e [new Evaluator -resultsource $ds]
+    set ::asynctest::done 0
+    set ::asynctest::outcome {}
+    return [list $ds $e]
+}
+proc ::asynctest::success {result} {
+    set ::asynctest::outcome [list ok $result]
+    set ::asynctest::done 1
+}
+proc ::asynctest::failure {message options} {
+    set ::asynctest::outcome [list error $message $options]
+    set ::asynctest::done 1
+}
+proc ::asynctest::start {e script args} {
+    $e evaluateAsync $script -timeslice 0 -oncomplete ::asynctest::success -onerror ::asynctest::failure {*}$args
+}
+proc ::asynctest::wait {} {
+    set timer [after 3000 {set ::asynctest::done timeout}]
+    try {
+        if {!$::asynctest::done} {
+            vwait ::asynctest::done
+        }
+        if {$::asynctest::done eq {timeout}} {
+            return -code error {Async job timed out}
+        }
+        return $::asynctest::outcome
+    } finally {
+        after cancel $timer
+    }
+}
+proc ::asynctest::heartbeat {} {
+    lappend ::asynctest::ticks $::asynctest::progress
+    set ::asynctest::pulse [after 1 ::asynctest::heartbeat]
+}
+proc ::asynctest::cleanup {} {
+    if {$::asynctest::pulse ne {}} {
+        after cancel $::asynctest::pulse
+        set ::asynctest::pulse {}
+    }
+    foreach o [lreverse $::asynctest::objects] {
+        if {[info object isa object $o]} {
+            catch {$o destroy}
+        }
+    }
+    set ::asynctest::objects {}
+}
+
+test evaluator-async-1.1 {start returns without script execution and heartbeat runs between commands} -body {
+    lassign [::asynctest::setup] ds e
+    set ::asynctest::progress 0
+    set ::asynctest::ticks {}
+    ::asynctest::heartbeat
+    set script {
+        set values {}
+        for {set i 0} {$i < 5} {incr i} {
+            lappend values [measure -xname x -data {x {0 1} y {2 2}} -avg {-vec y}]
+            incr ::asynctest::progress
+        }
+        set values
+    }
+    set expected [$e evaluate $script]
+    set ::asynctest::progress 0
+    set id [::asynctest::start $e $script]
+    set immediate $::asynctest::progress
+    lassign [::asynctest::wait] status result
+    set middle 0
+    foreach tick $::asynctest::ticks {
+        if {$tick > 0 && $tick < 5} {
+            set middle 1
+        }
+    }
+    list $id $immediate $status [expr {$result eq $expected}] $middle
+} -cleanup {::asynctest::cleanup} -result {1 0 ok 1 1}
+
+test evaluator-async-1.2 {evaluator and borrowed sources remain guarded while job is pending} -body {
+    lassign [::asynctest::setup] ds e
+    set tr [::asynctest::new Trace x unknown $ds]
+    $ds addTrace $tr
+    ::asynctest::start $e {return finished}
+    set codes [list [catch {$e evaluate {}}] [catch {$e reset}] [catch {$e destroy}]\
+                       [catch {$e attach $ds -name other}] [catch {$e detach results}] [catch {$e evaluateAsync {}}]\
+                       [catch {$ds reload}] [catch {$ds destroy}] [catch {$tr destroy}] [catch {$e trace results x}]]
+    set outcome [::asynctest::wait]
+    $e reset
+    list $codes $outcome [catch {$ds destroy}]
+} -cleanup {::asynctest::cleanup} -result {{1 1 1 1 1 1 1 1 1 1} {ok finished} 0}
+
+test evaluator-async-1.3 {script errors retain state and complete with original error options} -body {
+    lassign [::asynctest::setup] ds e
+    ::asynctest::start $e {set kept 4;error deliberate {} {TEST ASYNC ERROR}}
+    lassign [::asynctest::wait] status message options
+    list $status $message [dict get $options -errorcode] [$e evaluate {set kept}] [catch {$ds destroy}]
+} -cleanup {::asynctest::cleanup} -result {error deliberate {TEST ASYNC ERROR} 4 0}
+
+test evaluator-async-1.4 {cancel before first dispatch does not execute script} -body {
+    lassign [::asynctest::setup] ds e
+    ::asynctest::start $e {set shouldNotExist 1}
+    set cancelled [$e cancel]
+    lassign [::asynctest::wait] status message options
+    list $cancelled $status [dict get $options -errorcode] [$e evaluate {info exists shouldNotExist}] [$e cancel]
+} -cleanup {::asynctest::cleanup} -result {1 error {SPICETRACESURFER EVALUATOR CANCELLED} 0 0}
+
+test evaluator-async-1.5 {cancel at a suspended checkpoint unwinds script finally and releases resources} -body {
+    lassign [::asynctest::setup] ds e
+    $e evaluate [list set evaluator $e]
+    ::asynctest::start $e {
+        set cleaned 0
+        try {
+            after 0 [list $evaluator cancel]
+            measure -xname x -data {x {0 1} y {2 2}} -avg {-vec y}
+        } finally {set cleaned 1}
+    }
+    lassign [::asynctest::wait] status message options
+    list $status [dict get $options -errorcode] [$e evaluate {set cleaned}] \
+        [namespace which -command [info object namespace $e]::job1] [catch {$ds destroy}]
+} -cleanup {::asynctest::cleanup} -result {error {SPICETRACESURFER EVALUATOR CANCELLED} 1 {} 0}
+
+test evaluator-async-1.6 {partial source acquisition failure releases earlier borrows and busy flag} -body {
+    lassign [::asynctest::setup] ds e
+    set other [::asynctest::new DataSource input calculation]
+    $e attach $other
+    $other destroy
+    set code [catch {$e evaluateAsync {}}]
+    list $code [$e evaluate {expr {6+1}}] [catch {$ds destroy}]
+} -cleanup {::asynctest::cleanup} -result {1 7 0}
+
+test evaluator-async-1.7 {multiple evaluators hold independent borrows and duplicate aliases are harmless} -body {
+    lassign [::asynctest::setup] ds a
+    set b [::asynctest::new Evaluator -resultsource $ds]
+    $a attach $ds -name duplicate
+    set ::asynctest::borrowLog {}
+    proc ::asynctest::borrowDone {source label result} {
+        lappend ::asynctest::borrowLog [list $label [catch {$source checkNotInUse}]]
+        if {[llength $::asynctest::borrowLog] == 2} {
+            ::asynctest::success completed
+        }
+    }
+    ::asynctest::start $a {return first} -oncomplete [list ::asynctest::borrowDone $ds a]
+    ::asynctest::start $b {return second} -oncomplete [list ::asynctest::borrowDone $ds b]
+    set blocked [catch {$ds destroy}]
+    ::asynctest::wait
+    list $blocked $::asynctest::borrowLog [catch {$ds destroy}]
+} -cleanup {::asynctest::cleanup} -result {1 {{a 1} {b 0}} 0}
+
+test evaluator-async-1.8 {invalid scheduling options fail before acquiring sources} -body {
+    lassign [::asynctest::setup] ds e
+    list [catch {$e evaluateAsync {} -timeslice -1}] [catch {$e evaluateAsync {} -timeslice nope}]\
+            [$e evaluate {expr {2+2}}] [catch {$ds destroy}]
+} -cleanup {::asynctest::cleanup} -result {1 1 4 0}
+
+test evaluator-async-1.9 {completion callback can reset evaluator after finalization} -body {
+    lassign [::asynctest::setup] ds e
+    proc ::asynctest::resetDone {e result} {
+        $e reset
+        ::asynctest::success $result
+    }
+    ::asynctest::start $e {
+        set old 1
+        return done
+    } -oncomplete [list ::asynctest::resetDone $e]
+    list [::asynctest::wait] [$e evaluate {info exists old}]
+} -cleanup {::asynctest::cleanup} -result {{ok done} 0}
+
+test evaluator-async-1.10 {finished jobs leave no resume timer and synchronous calls do not yield} -body {
+    lassign [::asynctest::setup] ds e
+    set before [lsort [after info]]
+    ::asynctest::start $e {measure -xname x -data {x {0 1} y {3 3}} -avg {-vec y}}
+    ::asynctest::wait
+    list [expr {$before eq [lsort [after info]]}]\
+            [$e evaluate {measure -xname x -data {x {0 1} y {4 4}} -avg {-vec y}}]
+} -cleanup {::asynctest::cleanup} -result {1 4.0}
+
+testConstraint asyncVectors [expr {![catch {package require rbc::vector 0.8.1}]}]
+test evaluator-async-2.1 {nested trace substitution in native derive does not yield across C stack}\
+        -constraints asyncVectors -body {
+    lassign [::asynctest::setup] ds e
+    $e evaluate {
+        derive input {2+3}
+    }
+    ::asynctest::start $e {
+        derive output {[trace results input] * 2}
+    }
+    lassign [::asynctest::wait] status tr
+    list $status [[$tr getVector] range 0 end]
+} -cleanup {::asynctest::cleanup} -result {ok 10.0}
+
+::asynctest::cleanup
+namespace delete ::asynctest
+cleanupTests

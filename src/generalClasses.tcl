@@ -223,7 +223,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
     }
     variable name type filepath filetype dialect FileHandle RawPlots Traces
     variable csvbatchsize csvdelimiter csvencoding csvheader csvnametemplate
-    variable FileLocked RawFileStamp RawPath StageSerial Reloading
+    variable FileLocked RawFileStamp RawPath StageSerial Reloading Users
     initialize {
         variable SourceTypes
         const SourceTypes {file calculation network spreadsheet}
@@ -264,6 +264,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
         }]
         set FileLocked 0
         set Reloading 0
+        set Users {}
         set StageSerial 0
         set Traces [dict create]
         set RawPlots [dict create]
@@ -294,6 +295,38 @@ oo::configurable create ::spicetracesurfer::DataSource {
             return -options $options $message
         }
     }
+    method checkNotInUse {} {
+        # Rejects destructive operations while asynchronous evaluators borrow this source.
+        #
+        # Returns: Nothing when unused; a structured busy error otherwise.
+        if {[dict size $Users]} {
+            return -code error -errorcode {SPICETRACESURFER SOURCE INUSE}\
+                    {DataSource is in use by an asynchronous evaluation}
+        }
+    }
+    method beginUse {evaluator} {
+        # Borrows this source for an asynchronous evaluation, preventing reload and deletion.
+        # evaluator - Evaluator acquiring the borrow on its own behalf.
+        #
+        # Owner protocol; validates the actual calling object. Multiple evaluators may borrow a source.
+        # Returns: Nothing.
+        if {[catch {self caller} caller] || ([lindex $caller 1] ne $evaluator) ||\
+                    ![info object isa typeof $evaluator ::spicetracesurfer::Evaluator]} {
+            return -code error {Only the borrowing evaluator may acquire source use}
+        }
+        my CheckNotReloading
+        dict set Users $evaluator 1
+    }
+    method endUse {evaluator} {
+        # Releases an evaluator's borrow after completion or cancellation.
+        # evaluator - Evaluator releasing its own borrow.
+        #
+        # Returns: Nothing. Repeated release is harmless.
+        if {[catch {self caller} caller] || ([lindex $caller 1] ne $evaluator)} {
+            return -code error {Only the borrowing evaluator may release source use}
+        }
+        dict unset Users $evaluator
+    }
     method CheckNotReloading {} {
         # Rejects reentrant reload and destruction while replacement data is being prepared or committed.
         #
@@ -307,6 +340,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
         #
         # Returns: Nothing. Reentrant destruction during reload is rejected before cleanup starts.
         my CheckNotReloading
+        my checkNotInUse
         next
     }
     destructor {
@@ -371,6 +405,7 @@ oo::configurable create ::spicetracesurfer::DataSource {
         # Nested reload and source destruction are rejected until staging, commit and cleanup finish.
         # Returns: This DataSource object.
         my CheckNotReloading
+        my checkNotInUse
         if {($type ne {file}) || ($filetype ni {raw csv})} {
             return -code error {Reload requires a RAW or CSV file source}
         }
@@ -499,13 +534,17 @@ oo::configurable create ::spicetracesurfer::DataSource {
                     $current sealFileData
                 } on error {message options} {
                     # Before registration, the source owns cleanup of the new descriptor.
-                    if {[$current getOwner] eq {}} {$current disposeOwned}
+                    if {[$current getOwner] eq {}} {
+                        $current disposeOwned
+                    }
                     return -options $options $message
                 }
             }
         }
         dict for {key current} $existing {
-            if {![dict exists $incoming $key]} {$owner removeTraceOwned $key}
+            if {![dict exists $incoming $key]} {
+                $owner removeTraceOwned $key
+            }
         }
     }
     method StageRaw {stageVar} {
@@ -882,6 +921,7 @@ oo::configurable create ::spicetracesurfer::RawPlot {
         # Destroys an editable object. Locked file children are disposed by their source.
         #
         # Returns: Nothing.
+        $source checkNotInUse
         my CheckMetadataWritable
         next
     }
@@ -973,7 +1013,9 @@ oo::configurable create ::spicetracesurfer::RawPlot {
         }
         set key [$trace configure -name]
         if {[dict exists $Traces $key]} {
-            if {[dict get $Traces $key] eq $trace} {return}
+            if {[dict get $Traces $key] eq $trace} {
+                return
+            }
             return -code error "Trace '$key' already exists"
         }
         if {!$internal} {
@@ -1159,6 +1201,9 @@ oo::configurable create ::spicetracesurfer::Trace {
         # Destroys an editable object. Locked file children are disposed by their source.
         #
         # Returns: Nothing.
+        if {$Owner ne {}} {
+            $source checkNotInUse
+        }
         my CheckMetadataWritable
         next
     }
@@ -1365,7 +1410,7 @@ oo::configurable create ::spicetracesurfer::Evaluator {
 
                 ## Execution environment
                 User variables and helper procedures persist in a child namespace of the evaluator object namespace.
-                The commands trace, derive and publish are aliases to evaluator methods. RBC substitutions execute
+                The commands `trace`, `derive` and `publish` are aliases to evaluator methods. RBC substitutions execute
                 in the script namespace, allowing session variables, helper procedures and trace lookups in expressions.
                 Separate evaluator objects have separate script namespaces. This is organisation for trusted scripts,
                 not a security sandbox: fully qualified Tcl commands can access other application state.
@@ -1374,39 +1419,61 @@ oo::configurable create ::spicetracesurfer::Evaluator {
                 Evaluation errors propagate with their Tcl error options and stack trace. Variables, helper procedures
                 and completed results remain available for inspection and continued work; an error does not reset the
                 session. The busy state is cleared on every exit. During evaluation, nested evaluate, reset, destroy,
-                attach and detach calls are rejected. trace, derive and publish remain available to the running script.
+                attach and detach calls are rejected. `trace`, `derive` and `publish` remain available to the running
+                script.
 
                 `$evaluator reset` explicitly replaces the script namespace, restoring built-in aliases and configured
-                imports. Attached sources, published calculation traces, configuration and the result-vector name counter
-                survive. Variables, procedures, extra imports and temporary vector commands in the old script namespace
-                are removed. The replacement is fully initialized first; import failure leaves the old environment intact.
-                Reset also rejects reentrant lifecycle changes while deleting the old environment. Arbitrary after
-                callbacks and resources created outside the script namespace are not tracked or canceled. These guards
-                prevent overlapping operations; they do not interrupt a long-running script or keep the GUI responsive.
+                imports. Attached sources, published calculation traces, configuration and the result-vector name
+                counter survive. Variables, procedures, extra imports and temporary vector commands in the old script
+                namespace are removed. The replacement is fully initialized first; import failure leaves the old
+                environment intact.  Reset also rejects reentrant lifecycle changes while deleting the old
+                environment. Arbitrary after callbacks and resources created outside the script namespace are not
+                tracked or canceled. These guards prevent overlapping operations; they do not interrupt a long-running
+                script or keep the GUI responsive.
 
                 ## Preloaded commands
                 The spicetracesurfer package loads tclmeasure. By default each evaluator imports its exported
-                ::tclmeasure::measure command as measure in the script namespace. Imports persist across evaluate
+                `::tclmeasure::measure` command as `measure` in the script namespace. Imports persist across evaluate
                 calls and are local to that evaluator; loaded packages and their package-level state remain shared.
                 Destroying the evaluator removes imports without deleting the original extension commands.
 
-                The constructor's -imports option replaces the default with a list of explicit fully qualified
-                exported command names. Use -imports {} for no imports. Packages must already be loaded; the
+                The constructor's `-imports` option replaces the default with a list of explicit fully qualified
+                exported command names. Use `-imports {}` for no imports. Packages must already be loaded; the
                 evaluator does not infer package names or load packages from command names. Wildcards, missing or
-                unexported commands, duplicate short names and collisions with trace, derive or publish are errors.
-                Imports never use -force. The read-only -imports property reports the configured list.
+                unexported commands, duplicate short names and collisions with `trace`, `derive` or `publish` are
+                errors. The measure command is wrapped by the evaluator for cooperative checkpoints; other commands
+                use ordinary namespace imports. Imports never use `-force`. The read-only `-imports` property reports
+                the configured list.
 
                 With a vector-enabled build of tclmeasure, a script can measure real trace vectors directly:
 
                 ```tcl
                 $evaluator evaluate {
-                    measure -xname [trace simulation plot0 time] \
-                        -avg [list -vec [trace simulation plot0 {v(out)}]]
+                    measure -xname [trace simulation plot0 time] -avg [list -vec [trace simulation plot0 {v(out)}]]
                 }
                 ```
 
                 This reads the vectors without converting samples to lists or changing their protection. Direct
-                vector input requires tclmeasure built with --with-rbc; complex input is not supported by measure.
+                vector input requires tclmeasure built with `--with-rbc`; complex input is not supported by measure.
+
+                ## Asynchronous evaluation
+                `evaluateAsync` schedules a coroutine on this interpreter's event loop; it does not use threads. Calls
+                to `trace`, `derive`, `publish` and the wrapped `tclmeasure` measure yield automatically at outer
+                command boundaries when `-timeslice` expires. No yield occurs during ownership changes or nested native
+                expression substitutions. Pure Tcl loops without these commands and long native operations still block
+                the GUI. The event loop must run (Tk main loop, or vwait in headless tests).
+
+                Use `-oncomplete {command prefix}` to receive the result and `-onerror {command prefix}` to receive a
+                message and Tcl options dictionary. Callbacks execute globally after the evaluator becomes idle.
+                Without `-onerror`, failures are background errors. `cancel` requests normal error unwinding at the
+                next checkpoint, with error code `SPICETRACESURFER EVALUATOR CANCELLED`. Published results and script
+                state survive errors and cancellation. No automatic reset occurs. External direct calls to predefined
+                evaluator commands are rejected while an async job is active; scripts continue using those commands
+                normally.
+
+                Attached sources (including results) are borrowed until completion. Source reload and destruction and
+                registered child destruction are blocked. Borrows do not protect against deliberate vector destruction,
+                readonly removal or namespace manipulation. Multiple evaluators can borrow a source concurrently.
 
                 ## Results and ownership
                 The calculation source owns published traces and vectors. The evaluator borrows sources and never
@@ -1417,7 +1484,7 @@ oo::configurable create ::spicetracesurfer::Evaluator {
                 Automatic numeric typing requires RBC's named expression result API, added in rbc-tk9 commit 8c1713e.
                 The evaluator evaluates each expression once without converting its result through a Tcl list.
                 Complex inputs can produce real results, such as abs of a complex vector. Explicit real and complex
-                modes remain available. The physical -type option is independent of numeric type.
+                modes remain available. The physical `-type` option is independent of numeric type.
 
                 Only derive and publish create registered result traces; arbitrary temporary user vectors do not
                 become traces automatically. Publication moves the vector command into the calculation source's
@@ -1426,7 +1493,7 @@ oo::configurable create ::spicetracesurfer::Evaluator {
 
                 Result names must be nonempty and unique. Failed evaluation does not register its result trace and
                 cleans up its uncommitted destination. User-script side effects, including successful nested derives,
-                are not rolled back. Supplying a vector already assigned to any existing Trace is rejected.
+                are not rolled back. Supplying a vector already assigned to any existing `Trace` is rejected.
             }
             propertydescriptions {
                 -imports {
@@ -1453,8 +1520,8 @@ oo::configurable create ::spicetracesurfer::Evaluator {
     property imports -kind readable -get {
         return $Imports
     }
-    variable Sources ResultSource ResultAlias ScriptNamespace Serial Imports Busy NamespaceSerial
-
+    variable Sources ResultSource ResultAlias ScriptNamespace Serial Imports Busy NamespaceSerial Async JobSerial\
+            NativeDepth
     constructor {args} {
         # Creates a persistent script environment borrowing a calculation source.
         # -resultsource - source: Required live DataSource of type calculation; borrowed by the evaluator.
@@ -1471,6 +1538,9 @@ oo::configurable create ::spicetracesurfer::Evaluator {
             {-resultalias= -default results}
             {-imports= -default ::tclmeasure::measure}
         }]
+        set Async {}
+        set JobSerial 0
+        set NativeDepth 0
         set Busy {}
         set NamespaceSerial 0
         set Sources {}
@@ -1490,8 +1560,7 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         # Internal method. Call before setting a busy state or entering the finally block that clears it.
         # Returns: Nothing when idle; a structured busy error otherwise.
         if {$Busy ne {}} {
-            return -code error -errorcode {SPICETRACESURFER EVALUATOR BUSY}\
-                    "Cannot $operation while evaluator is $Busy"
+            return -code error -errorcode {SPICETRACESURFER EVALUATOR BUSY} "Cannot $operation while evaluator is $Busy"
         }
     }
     method destroy {} {
@@ -1570,6 +1639,10 @@ oo::configurable create ::spicetracesurfer::Evaluator {
             namespace eval $target [list ::namespace import $command]
             if {[namespace which -command ${target}::$tail] eq {}} {
                 return -code error "Import command '$command' is not exported by its namespace"
+            }
+            if {$command eq {::tclmeasure::measure}} {
+                rename ${target}::measure {}
+                interp alias {} ${target}::measure {} [self] measure
             }
         }
     }
@@ -1661,7 +1734,215 @@ oo::configurable create ::spicetracesurfer::Evaluator {
             set Busy {}
         }
     }
+    method measure {args} {
+        # Invokes tclmeasure with automatic async checkpoints in the evaluator script namespace.
+        # measurementArguments - Options accepted by ::tclmeasure::measure, forwarded unchanged.
+        #
+        # Direct vector names and caller namespace resolution are preserved. No sample lists are created here.
+        # Synopsis: ?measurementArguments ...?
+        # Returns: The measurement result.
+        return [my RunCommand measure $args]
+    }
+    method RunCommand {command arguments} {
+        # Runs one predefined operation with checkpoints only at outermost command boundaries.
+        # command - trace, derive, publish or measure.
+        # arguments - Argument list forwarded to the implementation.
+        #
+        # Nested calls, including RBC expression substitutions, never yield across a native C evaluation stack.
+        # External callbacks cannot use this evaluator's commands while its async coroutine is suspended.
+        # Returns: The operation result; errors propagate after restoring nesting depth.
+        if {($Busy eq {asynchronous}) && ([info coroutine] ne [dict get $Async coroutine])} {
+            return -code error -errorcode {SPICETRACESURFER EVALUATOR BUSY}\
+                    {Async evaluator commands belong to its running job}
+        }
+        if {$NativeDepth == 0} {
+            my Checkpoint
+        }
+        incr NativeDepth
+        try {
+            switch -- $command {
+                trace {
+                    set result [my TraceImpl {*}$arguments]
+                }
+                derive {
+                    set result [my DeriveImpl {*}$arguments]
+                }
+                publish {
+                    set result [my PublishImpl {*}$arguments]
+                }
+                measure {
+                    set result [namespace eval $ScriptNamespace [list ::tclmeasure::measure {*}$arguments]]
+                }
+            }
+        } finally {
+            incr NativeDepth -1
+        }
+        if {$NativeDepth == 0} {
+            my Checkpoint
+        }
+        return $result
+    }
+    method evaluateAsync {args} {
+        # Schedules a cooperative evaluation and returns before executing the script.
+        # script - Tcl script evaluated in the persistent session namespace.
+        # -oncomplete - commandPrefix: Global callback receiving the script result; defaults to no callback.
+        # -onerror - commandPrefix: Global callback receiving message and Tcl options; defaults to background error.
+        # -timeslice - milliseconds: Nonnegative checkpoint time budget; defaults to 10. Zero yields every checkpoint.
+        #
+        # Callbacks run after busy state and source borrows are released. Callback errors become background errors.
+        # Automatic checkpoints exist only in trace, derive, publish and wrapped measure. Long native commands and loops
+        # without these calls still block. Reset, destruction and attachment changes remain blocked while suspended.
+        # Synopsis: script ?-oncomplete commandPrefix? ?-onerror commandPrefix? ?-timeslice milliseconds?
+        # Returns: A monotonically increasing job number local to this evaluator.
+        my CheckIdle evaluateAsync
+        set arguments [argparse -inline -pfirst {
+            script
+            {-oncomplete= -default {}}
+            {-onerror= -default {}}
+            {-timeslice= -default 10}
+        }]
+        set budget [dict get $arguments timeslice]
+        if {![string is integer -strict $budget] || ($budget < 0)} {
+            return -code error {Async timeslice must be a nonnegative integer}
+        }
+        foreach option {oncomplete onerror} {
+            llength [dict get $arguments $option]
+        }
+        set id [incr JobSerial]
+        set Async [dict create id $id coroutine [info object namespace [self]]::job$id timer {} cancel 0\
+                           started 0 budget $budget last 0 script [dict get $arguments script] sources {}\
+                           oncomplete [dict get $arguments oncomplete] onerror [dict get $arguments onerror]]
+        set Busy asynchronous
+        try {
+            foreach source [lsort -unique [dict values $Sources]] {
+                my CheckSource $source
+                $source beginUse [self]
+                dict lappend Async sources $source
+            }
+            dict set Async timer [after 0 [namespace code [list my ResumeAsync $id]]]
+        } on error {message options} {
+            my ReleaseAsync
+            return -options $options $message
+        }
+        return $id
+    }
+    method cancel {} {
+        # Requests cancellation of the active asynchronous evaluation.
+        #
+        # Cancellation is observed at the next checkpoint or before script start. It raises an error in the
+        # coroutine so finally blocks execute; completed work remains. It cannot interrupt a native operation.
+        # Returns: One if a job is active, otherwise zero.
+        if {$Busy ne {asynchronous}} {
+            return 0
+        }
+        dict set Async cancel 1
+        return 1
+    }
+    method CheckCancellation {} {
+        # Raises a sticky cancellation error in the running async job when requested.
+        #
+        # Returns: Nothing unless cancellation was requested.
+        if {[dict get $Async cancel]} {
+            return -code error -errorcode {SPICETRACESURFER EVALUATOR CANCELLED} {Evaluation cancelled}
+        }
+    }
+    method Checkpoint {} {
+        # Suspends the evaluator coroutine at a consistent outer command boundary when its budget expires.
+        #
+        # Synchronous evaluation is unaffected. The resume callback, rather than yield itself, returns control
+        # to the event loop and schedules the next interval. No callbacks or timers are created here.
+        # Returns: Nothing after resumption; cancellation raises an error and unwinds normally.
+        if {$Busy ne {asynchronous}} {
+            return
+        }
+        my CheckCancellation
+        if {([clock clicks -milliseconds] - [dict get $Async last]) >= [dict get $Async budget]} {
+            yield
+            my CheckCancellation
+        }
+    }
+    method AsyncBody {script} {
+        # Executes the script inside the job coroutine with normal Tcl method return semantics.
+        # script - User script.
+        #
+        # Returns: Script result; script errors and cancellation propagate to ResumeAsync.
+        my CheckCancellation
+        namespace eval $ScriptNamespace $script
+    }
+    method ResumeAsync {id} {
+        # Starts or resumes one coroutine interval from a scheduled event-loop callback.
+        # id - Job generation; obsolete callbacks are ignored.
+        #
+        # Releases all lifecycle guards before notifying completion. A 1 ms timer between intervals allows
+        # other events to run. Raw user yield also suspends, but only predefined checkpoints check cancellation.
+        # Returns: Nothing; unhandled job errors and callback errors follow Tcl background-error handling.
+        if {($Busy ne {asynchronous}) || ([dict get $Async id] != $id)} {
+            return
+        }
+        dict set Async timer {}
+        dict set Async last [clock clicks -milliseconds]
+        set coroutine [dict get $Async coroutine]
+        set code [catch {
+            if {![dict get $Async started]} {
+                dict set Async started 1
+                coroutine $coroutine {*}[namespace code [list my AsyncBody [dict get $Async script]]]
+            } else {
+                $coroutine
+            }
+        } result options]
+        if {!$code && ([namespace which -command $coroutine] ne {})} {
+            dict set Async timer [after 1 [namespace code [list my ResumeAsync $id]]]
+            return
+        }
+        if {!$code && [dict get $Async cancel]} {
+            set code [catch {my CheckCancellation} result options]
+        }
+        if {$code} {
+            set callback [dict get $Async onerror]
+        } else {
+            set callback [dict get $Async oncomplete]
+        }
+        my ReleaseAsync
+        if {$callback ne {}} {
+            if {$code} {
+                uplevel #0 [list {*}$callback $result $options]
+            } else {
+                uplevel #0 [list {*}$callback $result]
+            }
+        } elseif {$code} {
+            return -options $options $result
+        }
+    }
+    method ReleaseAsync {} {
+        # Cancels the pending resume timer and releases every acquired source borrow.
+        #
+        # Internal finalization for startup errors and completed jobs. The coroutine has already finished.
+        # Returns: Nothing. Busy state is cleared before application callbacks run.
+        set timer [dict get $Async timer]
+        if {$timer ne {}} {
+            after cancel $timer
+        }
+        foreach source [dict get $Async sources] {
+            $source endUse [self]
+        }
+        set Async {}
+        set Busy {}
+    }
     method trace {args} {
+        # Resolves an attached waveform and returns its vector.
+        # alias - Evaluator-local alias of an attached source.
+        # plotname - Optional RAW plot name; omit for directly owned traces.
+        # tracename - Local trace name within the source or selected plot.
+        #
+        # With two arguments, looks up a directly owned trace. With three, looks within a RAW plot. Rejects unattached
+        # or destroyed sources. Missing names raise lookup errors. Calling the trace's getVector method can trigger lazy
+        # RAW loading. Names are separate literal arguments.
+        # Synopsis: alias tracename
+        # Synopsis: alias plotname tracename
+        # Returns: The resolved RBC vector command name.
+        return [my RunCommand trace $args]
+    }
+    method TraceImpl {args} {
         # Resolves an attached waveform and returns its vector.
         # alias - Evaluator-local alias of an attached source.
         # plotname - Optional RAW plot name; omit for directly owned traces.
@@ -1735,6 +2016,24 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         # expression side effects, including nested successful derives, remain.
         # Synopsis: name expression ?-type physicalType? ?-numtype numericType?
         # Returns: The newly registered Trace object command.
+        return [my RunCommand derive $args]
+    }
+    method DeriveImpl {args} {
+        # Evaluates an RBC expression once and publishes its result as a new trace.
+        # name - Nonempty, unused trace name in the calculation source.
+        # expression - RBC vector expression evaluated in the script namespace.
+        # -type - physicalType: Physical data type assigned to the trace; defaults to unknown.
+        # -numtype - numericType: Destination numeric type: auto (default), real or complex.
+        #
+        # The physical type defaults to unknown. Numeric type defaults to auto, using RBC expr with -name to preserve
+        # the evaluated real or complex type without a Tcl result list.  Explicit real rejects complex results; explicit
+        # complex promotes real results with zero imaginary components. Variable and command substitutions run in the
+        # script namespace.
+        #
+        # An unused result name is required. Failed evaluation/publication cleans up the uncommitted vector. Arbitrary
+        # expression side effects, including nested successful derives, remain.
+        # Synopsis: name expression ?-type physicalType? ?-numtype numericType?
+        # Returns: The newly registered Trace object command.
         set arguments [argparse -inline -pfirst {
             name
             expression
@@ -1791,6 +2090,34 @@ oo::configurable create ::spicetracesurfer::Evaluator {
         return
     }
     method publish {args} {
+        # Transfers an existing vector into a new trace owned by the calculation source.
+        # name - Nonempty, unused trace name in the calculation source.
+        # vector - Existing, unowned RBC vector with its standard command name; relative names resolve in the session
+        #   namespace.
+        # -type - physicalType: Physical data type assigned to the trace; defaults to unknown.
+        #
+        # Relative commands resolve in the session namespace even for direct method calls. Requires an existing vector
+        # with its standard RBC command name; aliases/custom commands and vectors already assigned to another Trace are
+        # rejected. Duplicate result names are rejected.
+        #
+        # Renames the vector into the result source namespace without copying samples and removes its mapped array
+        # association, including watchunset-based session lifetime coupling. The old vector command name is invalid
+        # after success; use the returned trace's getVector.  On an unsuccessful transfer, cleanup attempts to restore
+        # the original name and mapping.
+        #
+        # ```tcl
+        # $evaluator evaluate {
+        #     rbc::vector create temporary -variable {}
+        #     temporary set {1 2 3}
+        #     set resultTrace [publish samples temporary -type voltage]
+        #     set resultVector [$resultTrace getVector]
+        # }
+        # ```
+        # Synopsis: name vector ?-type physicalType?
+        # Returns: The newly registered Trace object command.
+        return [my RunCommand publish $args]
+    }
+    method PublishImpl {args} {
         # Transfers an existing vector into a new trace owned by the calculation source.
         # name - Nonempty, unused trace name in the calculation source.
         # vector - Existing, unowned RBC vector with its standard command name; relative names resolve in the session
